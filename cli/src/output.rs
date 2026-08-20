@@ -2257,6 +2257,31 @@ Examples:
 "##
         }
 
+        // === Maintenance ===
+        "reap" => {
+            r##"
+agent-browser reap - Remove stale daemon pid/socket entries
+
+Usage: agent-browser reap
+
+Scans the daemon socket directory and removes .pid/.sock/.stream/.port
+entries whose recorded process is dead, or whose PID now belongs to a
+different program (PID reuse). Entries owned by a live agent-browser
+daemon are never touched.
+
+The same sweep runs automatically on every daemon startup and before
+every command, so this command is only needed for explicit cleanup or
+reporting.
+
+Global Options:
+  --json               Output as JSON
+
+Examples:
+  agent-browser reap
+  agent-browser reap --json
+"##
+        }
+
         // === Connect ===
         "connect" => {
             r##"
@@ -2523,6 +2548,9 @@ Sessions:
   session                    Show current session name
   session list               List active sessions
 
+Maintenance:
+  reap                       Remove stale daemon pid/socket entries
+
 Setup:
   install                    Install browser binaries
   install --with-deps        Also install system dependencies (Linux)
@@ -2623,7 +2651,8 @@ Environment:
   AGENT_BROWSER_STATE_EXPIRE_DAYS Auto-delete saved states older than N days (default: 30)
   AGENT_BROWSER_ENCRYPTION_KEY   64-char hex key for AES-256-GCM session encryption
   AGENT_BROWSER_STREAM_PORT      Enable WebSocket streaming on port (e.g., 9223)
-  AGENT_BROWSER_IDLE_TIMEOUT_MS  Auto-shutdown daemon after N ms of inactivity (disabled by default)
+  AGENT_BROWSER_IDLE_TIMEOUT_MS  Auto-shutdown daemon after N ms of inactivity (default: 7200000, 0 disables)
+  AGENT_BROWSER_MAX_AGE_MS       Max daemon lifetime in ms (default: 86400000, 0 disables)
   AGENT_BROWSER_IOS_DEVICE       Default iOS device name
   AGENT_BROWSER_IOS_UDID         Default iOS device UDID
   AGENT_BROWSER_CONTENT_BOUNDARIES Wrap page output in boundary markers

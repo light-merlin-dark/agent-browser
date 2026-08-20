@@ -15,12 +15,43 @@ use super::actions::{execute_command, DaemonState};
 use super::cdp::client::CdpClient;
 use super::state;
 use super::stream::StreamServer;
+use crate::reap;
+
+/// Default idle timeout: 2 hours. Far longer than typical gaps between
+/// commands in an agent session, so active sessions are never killed, while
+/// bounding how long an orphaned daemon (and its browser) can linger.
+/// Override with AGENT_BROWSER_IDLE_TIMEOUT_MS (0 disables).
+const DEFAULT_IDLE_TIMEOUT_MS: u64 = 2 * 60 * 60 * 1000;
+
+/// Default max daemon age: 24 hours. Hard backstop on daemon lifetime that
+/// bounds worst-case leakage even if idle-reset logic misbehaves (e.g. a
+/// misbehaving client polling forever). Override with
+/// AGENT_BROWSER_MAX_AGE_MS (0 disables).
+const DEFAULT_MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Parse a lifetime env var: unset or unparseable falls back to `default_ms`,
+/// an explicit 0 disables the limit.
+fn lifetime_limit_ms(name: &str, default_ms: u64) -> Option<u64> {
+    let raw = match env::var(name) {
+        Ok(v) => v,
+        Err(_) => return Some(default_ms),
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(0) => None,
+        Ok(ms) => Some(ms),
+        Err(_) => Some(default_ms),
+    }
+}
 
 pub async fn run_daemon(session: &str) {
     let socket_dir = get_daemon_socket_dir();
     if !socket_dir.exists() {
         let _ = fs::create_dir_all(&socket_dir);
     }
+
+    // Sweep stale pid/socket entries left behind by daemons that died without
+    // cleanup. Cheap and never touches entries owned by a live process.
+    let _ = reap::sweep_socket_dir(&socket_dir);
 
     let pid_path = socket_dir.join(format!("{}.pid", session));
     let _ = fs::write(&pid_path, process::id().to_string());
@@ -62,12 +93,16 @@ pub async fn run_daemon(session: &str) {
         }
     }
 
-    // Auto-shutdown the daemon after this many ms of inactivity (no commands received).
-    // Disabled when unset or 0.
-    let idle_timeout_ms = env::var("AGENT_BROWSER_IDLE_TIMEOUT_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&ms| ms > 0);
+    // Auto-shutdown the daemon after this many ms of inactivity (no commands
+    // received). Defaults on (2h) so orphaned daemons cannot linger forever;
+    // AGENT_BROWSER_IDLE_TIMEOUT_MS overrides, 0 disables.
+    let idle_timeout_ms =
+        lifetime_limit_ms("AGENT_BROWSER_IDLE_TIMEOUT_MS", DEFAULT_IDLE_TIMEOUT_MS);
+
+    // Hard cap on daemon lifetime regardless of activity. Defaults on (24h)
+    // as a backstop against worst-case leakage; AGENT_BROWSER_MAX_AGE_MS
+    // overrides, 0 disables.
+    let max_age_ms = lifetime_limit_ms("AGENT_BROWSER_MAX_AGE_MS", DEFAULT_MAX_AGE_MS);
 
     let result = run_socket_server(
         &socket_path,
@@ -75,6 +110,7 @@ pub async fn run_daemon(session: &str) {
         stream_client,
         stream_server_instance,
         idle_timeout_ms,
+        max_age_ms,
     )
     .await;
 
@@ -96,6 +132,7 @@ async fn run_socket_server(
     stream_client: Option<Arc<RwLock<Option<Arc<CdpClient>>>>>,
     stream_server: Option<Arc<StreamServer>>,
     idle_timeout_ms: Option<u64>,
+    max_age_ms: Option<u64>,
 ) -> Result<(), String> {
     use tokio::net::UnixListener;
 
@@ -108,6 +145,10 @@ async fn run_socket_server(
 
     let (reset_tx, mut reset_rx) = mpsc::channel::<()>(64);
     let reset_tx = idle_timeout_ms.map(|_| Arc::new(reset_tx));
+
+    // Absolute deadline for the max-age backstop (recreated each select
+    // iteration; sleep_until on an absolute instant is drift-free).
+    let started = tokio::time::Instant::now();
 
     loop {
         let sleep_future = idle_timeout_ms.map(|ms| tokio::time::sleep(Duration::from_millis(ms)));
@@ -135,6 +176,23 @@ async fn run_socket_server(
                     std::future::pending::<()>().await
                 }
             }, if idle_timeout_ms.is_some() => {
+                let mut s = state.lock().await;
+                if let Some(ref mut mgr) = s.browser {
+                    let _ = mgr.close().await;
+                }
+                break;
+            }
+            _ = async {
+                if let Some(ms) = max_age_ms {
+                    tokio::time::sleep_until(started + Duration::from_millis(ms)).await
+                } else {
+                    std::future::pending::<()>().await
+                }
+            }, if max_age_ms.is_some() => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "Daemon reached max age; shutting down"
+                );
                 let mut s = state.lock().await;
                 if let Some(ref mut mgr) = s.browser {
                     let _ = mgr.close().await;
@@ -164,6 +222,7 @@ async fn run_socket_server(
     stream_client: Option<Arc<RwLock<Option<Arc<CdpClient>>>>>,
     stream_server: Option<Arc<StreamServer>>,
     idle_timeout_ms: Option<u64>,
+    max_age_ms: Option<u64>,
 ) -> Result<(), String> {
     use tokio::net::TcpListener;
 
@@ -182,6 +241,8 @@ async fn run_socket_server(
 
     let (reset_tx, mut reset_rx) = mpsc::channel::<()>(64);
     let reset_tx = idle_timeout_ms.map(|_| Arc::new(reset_tx));
+
+    let started = tokio::time::Instant::now();
 
     loop {
         let sleep_future = idle_timeout_ms.map(|ms| tokio::time::sleep(Duration::from_millis(ms)));
@@ -209,6 +270,24 @@ async fn run_socket_server(
                     std::future::pending::<()>().await
                 }
             }, if idle_timeout_ms.is_some() => {
+                let mut s = state.lock().await;
+                if let Some(ref mut mgr) = s.browser {
+                    let _ = mgr.close().await;
+                }
+                let _ = fs::remove_file(&port_path);
+                break;
+            }
+            _ = async {
+                if let Some(ms) = max_age_ms {
+                    tokio::time::sleep_until(started + Duration::from_millis(ms)).await
+                } else {
+                    std::future::pending::<()>().await
+                }
+            }, if max_age_ms.is_some() => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "Daemon reached max age; shutting down"
+                );
                 let mut s = state.lock().await;
                 if let Some(ref mut mgr) = s.browser {
                     let _ = mgr.close().await;

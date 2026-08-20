@@ -487,7 +487,9 @@ agent-browser --session agent1 close   # Close specific session
 
 If a previous session was not closed properly, the daemon may still be running. Use `agent-browser close` to clean it up before starting new work.
 
-To auto-shutdown the daemon after a period of inactivity (useful for ephemeral/CI environments):
+Daemons shut down automatically after 2 hours of inactivity (override: `AGENT_BROWSER_IDLE_TIMEOUT_MS`, `0` disables) and after 24 hours of total lifetime (override: `AGENT_BROWSER_MAX_AGE_MS`, `0` disables). Stale daemon pid/socket files are swept automatically on every command; run `agent-browser reap` to sweep manually and see what was removed.
+
+To change the inactivity timeout (e.g. for ephemeral/CI environments):
 
 ```bash
 AGENT_BROWSER_IDLE_TIMEOUT_MS=60000 agent-browser open example.com

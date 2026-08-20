@@ -303,6 +303,12 @@ fn apply_daemon_env(cmd: &mut Command, session: &str, opts: &DaemonOptions) {
 }
 
 pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult, String> {
+    // Sweep stale pid/socket entries left behind by daemons that died without
+    // cleanup. Runs on every command so the socket dir self-heals constantly.
+    // Cheap (one read_dir plus a kill(pid, 0) probe per entry) and never
+    // touches entries owned by a live process.
+    let _ = crate::reap::sweep_socket_dir(&get_socket_dir());
+
     // Check if daemon is running AND responsive
     if is_daemon_running(session) && daemon_ready(session) {
         // Double-check it's actually responsive by waiting and checking again

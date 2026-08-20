@@ -34,6 +34,20 @@ Each session has its own:
 - Navigation history
 - Authentication state
 
+## Daemon lifecycle and cleanup
+
+Each session is served by a background daemon that keeps the browser alive between commands. Daemons shut down automatically:
+
+- After **2 hours** of inactivity (no commands received). Override with `AGENT_BROWSER_IDLE_TIMEOUT_MS` (milliseconds, `0` disables).
+- After **24 hours** of total lifetime, regardless of activity. Override with `AGENT_BROWSER_MAX_AGE_MS` (milliseconds, `0` disables).
+
+Stale daemon pid/socket files (left behind when a daemon exits without cleanup) are swept automatically on every command and on daemon startup. To sweep manually and get a report:
+
+```bash
+agent-browser reap          # Remove stale entries, keep live sessions
+agent-browser reap --json   # Machine-readable report
+```
+
 ## Persistent profiles
 
 By default, browser state is lost when the browser closes. Use `--profile` to persist state across restarts:

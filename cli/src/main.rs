@@ -5,6 +5,7 @@ mod flags;
 mod install;
 mod native;
 mod output;
+mod reap;
 #[cfg(test)]
 mod test_utils;
 mod validation;
@@ -163,6 +164,38 @@ fn run_session(args: &[String], session: &str, json_mode: bool) {
     }
 }
 
+fn run_reap(json_mode: bool) {
+    let socket_dir = get_socket_dir();
+    let report = reap::sweep_socket_dir(&socket_dir);
+
+    if json_mode {
+        print_json_value(json!({
+            "success": report.errors.is_empty(),
+            "data": {
+                "socketDir": socket_dir,
+                "removed": report.removed,
+                "kept": report.kept,
+                "errors": report.errors,
+            },
+        }));
+        return;
+    }
+
+    if report.removed.is_empty() && report.errors.is_empty() {
+        println!("No stale daemon entries found");
+    } else {
+        for name in &report.removed {
+            println!("Removed stale entries for session: {}", name);
+        }
+        for e in &report.errors {
+            eprintln!("{} {}", color::error_indicator(), e);
+        }
+    }
+    if !report.kept.is_empty() {
+        println!("Live sessions kept: {}", report.kept.join(", "));
+    }
+}
+
 fn main() {
     // Rust ignores SIGPIPE by default, causing println! to panic on broken pipes.
     // Reset to SIG_DFL so the OS terminates the process cleanly instead.
@@ -229,6 +262,12 @@ fn main() {
     // Handle session separately (doesn't need daemon)
     if clean.first().map(|s| s.as_str()) == Some("session") {
         run_session(&clean, &flags.session, flags.json);
+        return;
+    }
+
+    // Handle reap separately (doesn't need daemon)
+    if clean.first().map(|s| s.as_str()) == Some("reap") {
+        run_reap(flags.json);
         return;
     }
 

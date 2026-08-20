@@ -358,7 +358,8 @@ agent-browser --session-name myapp state load ./my-auth.json
 > **Security notes:**
 > - `--remote-debugging-port` exposes full browser control on localhost. Any local process can connect. Only use on trusted machines and close Chrome when done.
 > - State files contain session tokens in plaintext. Add them to `.gitignore` and delete when no longer needed. For encryption at rest, set `AGENT_BROWSER_ENCRYPTION_KEY` (see [State Encryption](#state-encryption)).
-
+> - Recommended anti-bloat + anti-secrets hygiene: enable a global ignore file (see docs section “Global .gitignore”).
+>
 For full details on login flows, OAuth, 2FA, cookie-based auth, and the auth vault, see the [Authentication](docs/src/app/sessions/page.mdx) docs.
 
 ## Sessions
@@ -960,7 +961,7 @@ agent-browser uses a client-daemon architecture:
 1. **Rust CLI** - Parses commands, communicates with daemon
 2. **Rust Daemon** - Pure Rust daemon using direct CDP, no Node.js required
 
-The daemon starts automatically on first command and persists between commands for fast subsequent operations. To auto-shutdown the daemon after a period of inactivity, set `AGENT_BROWSER_IDLE_TIMEOUT_MS` (value in milliseconds). When set, the daemon closes the browser and exits after receiving no commands for the specified duration.
+The daemon starts automatically on first command and persists between commands for fast subsequent operations. To prevent orphaned daemons (and their browsers) from lingering, the daemon closes the browser and exits after a period of inactivity (default: 2 hours; override with `AGENT_BROWSER_IDLE_TIMEOUT_MS` in milliseconds, `0` disables) and enforces a maximum lifetime (default: 24 hours; override with `AGENT_BROWSER_MAX_AGE_MS`, `0` disables). Stale daemon pid/socket files are swept automatically on every command and daemon startup; run `agent-browser reap` to sweep manually and report what was removed.
 
 **Browser Engine:** Uses Chrome (from Chrome for Testing) by default. The `--engine` flag selects between `chrome` and `lightpanda`. Supported browsers: Chromium/Chrome (via CDP) and Safari (via WebDriver for iOS).
 

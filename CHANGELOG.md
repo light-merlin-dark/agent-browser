@@ -1,5 +1,16 @@
 # agent-browser
 
+## 0.20.14
+
+### Patch Changes
+
+- ### Daemon lifecycle hardening
+
+  - **Default-on idle shutdown** - Daemons now close the browser and exit after 2 hours of inactivity by default (previously opt-in). Override with `AGENT_BROWSER_IDLE_TIMEOUT_MS` (milliseconds, `0` disables).
+  - **Max daemon age backstop** - Daemons shut down cleanly after 24 hours of total lifetime regardless of activity, bounding worst-case leakage from orphaned daemons. Override with `AGENT_BROWSER_MAX_AGE_MS` (milliseconds, `0` disables).
+  - **Stale-entry reaper** - Stale `.pid`/`.sock`/`.stream`/`.port` entries in the daemon socket directory (left behind when a daemon exits without cleanup) are now swept automatically on every command and on daemon startup. Entries are only removed when the recorded PID is dead or belongs to a different program (PID-reuse guard); live daemons are never touched.
+  - **New `agent-browser reap` command** - Runs the sweeper manually and reports which session entries were removed and which live sessions were kept (`--json` supported).
+
 ## 0.20.13
 
 ### Patch Changes
