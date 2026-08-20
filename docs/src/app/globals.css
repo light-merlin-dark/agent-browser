@@ -16,6 +16,7 @@
   --color-muted-foreground: var(--muted-foreground);
   --color-primary: var(--primary);
   --color-primary-foreground: var(--primary-foreground);
+  --color-sidebar: var(--sidebar);
 }
 
 :root {
@@ -26,6 +27,7 @@
   --muted-foreground: #737373;
   --primary: #171717;
   --primary-foreground: #fff;
+  --sidebar: #f5f5f5;
 }
 
 .dark {
@@ -36,6 +38,7 @@
   --muted-foreground: #a3a3a3;
   --primary: #f5f5f5;
   --primary-foreground: #0a0a0a;
+  --sidebar: #171717;
 }
 
 html {
@@ -129,6 +132,23 @@ pre:not(.shiki) {
   font-size: 0.875em;
 }
 
+/* Diff line highlighting */
+.diff-add {
+  color: #00952d;
+}
+
+.diff-remove {
+  color: #f32e40;
+}
+
+.dark .diff-add {
+  color: #00ca50;
+}
+
+.dark .diff-remove {
+  color: #f32e40;
+}
+
 /* Shiki dual theme support */
 .shiki,
 .shiki span {
@@ -178,6 +198,27 @@ pre:not(.shiki) {
   font-weight: 600;
   margin-top: 2rem;
   margin-bottom: 0.75rem;
+  color: var(--foreground);
+}
+
+.prose .heading-anchor {
+  position: relative;
+}
+
+.prose .heading-anchor > a {
+  opacity: 0;
+  margin-left: 0.375rem;
+  color: var(--muted-foreground);
+  text-decoration: none;
+  font-weight: 400;
+  transition: opacity 0.15s ease;
+}
+
+.prose .heading-anchor:hover > a {
+  opacity: 1;
+}
+
+.prose .heading-anchor > a:hover {
   color: var(--foreground);
 }
 

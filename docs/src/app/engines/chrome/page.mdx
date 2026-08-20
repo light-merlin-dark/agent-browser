@@ -1,7 +1,3 @@
-import { pageMetadata } from "@/lib/page-metadata"
-
-export const metadata = pageMetadata("engines/chrome")
-
 # Chrome
 
 Chrome (and Chromium) is the default browser engine. agent-browser discovers, launches, and manages the Chrome process automatically via the Chrome DevTools Protocol (CDP).
@@ -21,6 +17,8 @@ When no `--executable-path` is provided, agent-browser searches for Chrome in th
         <code>/Applications/Google Chrome.app</code>,
         <code>/Applications/Google Chrome Canary.app</code>,
         <code>/Applications/Chromium.app</code>,
+        <code>/Applications/Brave Browser.app</code>,
+        Puppeteer cache (<code>~/.cache/puppeteer/chrome/</code> or <code>PUPPETEER_CACHE_DIR</code>),
         Chrome for Testing cache
       </td>
     </tr>
@@ -31,6 +29,7 @@ When no `--executable-path` is provided, agent-browser searches for Chrome in th
         <code>google-chrome-stable</code>,
         <code>chromium-browser</code>,
         <code>chromium</code> in PATH,
+        Puppeteer cache (<code>~/.cache/puppeteer/chrome/</code> or <code>PUPPETEER_CACHE_DIR</code>),
         Chrome for Testing cache
       </td>
     </tr>
@@ -86,9 +85,10 @@ These features are available only with Chrome:
   </thead>
   <tbody>
     <tr><td>Browser extensions</td><td><code>--extension &lt;path&gt;</code></td></tr>
-    <tr><td>Persistent profiles</td><td><code>--profile &lt;path&gt;</code></td></tr>
+    <tr><td>Persistent profiles</td><td><code>--profile &lt;path&gt;</code> (sets Chrome's <code>--user-data-dir</code>)</td></tr>
     <tr><td>Storage state</td><td><code>--state &lt;path&gt;</code></td></tr>
     <tr><td>File URL access</td><td><code>--allow-file-access</code></td></tr>
+    <tr><td>Headless screenshot scrollbars</td><td><code>--hide-scrollbars false</code> keeps native scrollbars visible</td></tr>
     <tr><td>Headed mode</td><td><code>--headed</code></td></tr>
     <tr><td>Custom launch args</td><td><code>--args &lt;args&gt;</code></td></tr>
   </tbody>

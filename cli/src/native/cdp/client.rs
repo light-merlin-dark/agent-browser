@@ -1,16 +1,22 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::sync::{broadcast, oneshot, Mutex};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 
 use super::types::{CdpCommand, CdpEvent, CdpMessage};
 
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<CdpMessage>>>>;
+
+/// Interval between WebSocket ping frames sent to keep the connection alive
+/// through intermediate proxies (reverse proxies, load balancers, service meshes).
+const WS_KEEPALIVE_INTERVAL_SECS: u64 = 30;
 
 /// Raw incoming CDP message (text) broadcast to all subscribers.
 /// Used by the inspect proxy to forward responses and events to DevTools.
@@ -36,13 +42,59 @@ pub struct CdpClient {
     event_tx: broadcast::Sender<CdpEvent>,
     raw_tx: broadcast::Sender<RawCdpMessage>,
     _reader_handle: tokio::task::JoinHandle<()>,
+    _keepalive_handle: tokio::task::JoinHandle<()>,
+}
+
+/// Removes a pending entry if `send_command` is cancelled mid-await (e.g. an
+/// outer timeout on the liveness probe), so a command whose response never
+/// comes can't leak until the connection closes (#1528). Normal exits disarm
+/// it via `done`.
+struct PendingGuard {
+    pending: PendingMap,
+    id: u64,
+    done: bool,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let pending = self.pending.clone();
+        let id = self.id;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                pending.lock().await.remove(&id);
+            });
+        }
+    }
 }
 
 impl CdpClient {
     pub async fn connect(url: &str) -> Result<Self, String> {
-        // Use unlimited message/frame sizes to handle large CDP responses
-        // (e.g. Accessibility.getFullAXTree) over remote WSS connections where
-        // proxies may produce frames exceeding the default 16 MiB limit.
+        Self::connect_with_headers(url, None).await
+    }
+
+    pub async fn connect_with_headers(
+        url: &str,
+        headers: Option<Vec<(String, String)>>,
+    ) -> Result<Self, String> {
+        let mut request = url
+            .into_client_request()
+            .map_err(|e| format!("Invalid WebSocket URL: {}", e))?;
+
+        if let Some(hdrs) = headers {
+            let req_headers = request.headers_mut();
+            for (key, value) in hdrs {
+                if let (Ok(name), Ok(val)) = (
+                    key.parse::<tokio_tungstenite::tungstenite::http::header::HeaderName>(),
+                    value.parse::<tokio_tungstenite::tungstenite::http::header::HeaderValue>(),
+                ) {
+                    req_headers.insert(name, val);
+                }
+            }
+        }
+
         let ws_config = WebSocketConfig {
             max_message_size: None,
             max_frame_size: None,
@@ -50,20 +102,25 @@ impl CdpClient {
         };
 
         let (ws_stream, _) =
-            tokio_tungstenite::connect_async_with_config(url, Some(ws_config), false)
+            tokio_tungstenite::connect_async_with_config(request, Some(ws_config), false)
                 .await
                 .map_err(|e| format!("CDP WebSocket connect failed: {}", e))?;
+
+        enable_tcp_keepalive(ws_stream.get_ref());
 
         let (ws_tx, mut ws_rx) = ws_stream.split();
         let ws_tx = Arc::new(Mutex::new(ws_tx));
 
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
-        let (event_tx, _) = broadcast::channel(256);
-        let (raw_tx, _) = broadcast::channel(512);
+        let (event_tx, _) = broadcast::channel(4096);
+        let (raw_tx, _) = broadcast::channel(4096);
 
         let pending_clone = pending.clone();
         let event_tx_clone = event_tx.clone();
         let raw_tx_clone = raw_tx.clone();
+
+        // Notify used to stop the keepalive task when the reader loop exits.
+        let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
 
         let reader_handle = tokio::spawn(async move {
             while let Some(msg) = ws_rx.next().await {
@@ -75,9 +132,25 @@ impl CdpClient {
                         Ok(text) => text,
                         Err(_) => continue,
                     },
-                    Ok(Message::Close(_)) => break,
+                    Ok(Message::Close(frame)) => {
+                        if std::env::var("AGENT_BROWSER_DEBUG").is_ok() {
+                            let reason = frame
+                                .as_ref()
+                                .map(|f| format!("code={}, reason={}", f.code, f.reason))
+                                .unwrap_or_else(|| "no frame".to_string());
+                            let _ =
+                                writeln!(std::io::stderr(), "[cdp] WebSocket Close: {}", reason);
+                        }
+                        break;
+                    }
+                    Ok(Message::Pong(_)) => continue,
                     Ok(_) => continue,
-                    Err(_) => break,
+                    Err(e) => {
+                        if std::env::var("AGENT_BROWSER_DEBUG").is_ok() {
+                            let _ = writeln!(std::io::stderr(), "[cdp] WebSocket Error: {}", e);
+                        }
+                        break;
+                    }
                 };
 
                 // Broadcast raw message for inspect proxy subscribers before typed parse,
@@ -120,6 +193,28 @@ impl CdpClient {
             // command senders so callers get an immediate channel-closed error
             // instead of waiting for the 30-second timeout.
             pending_clone.lock().await.clear();
+
+            // Stop the keepalive task — the connection is gone.
+            let _ = cancel_tx.send(true);
+        });
+
+        // Spawn a keepalive task that sends WebSocket Ping frames at a regular
+        // interval. This prevents intermediate proxies (Envoy, nginx, OpenResty,
+        // cloud load balancers) from closing idle WebSocket connections. If the
+        // send fails, the connection is dead and we stop pinging.
+        let keepalive_tx = ws_tx.clone();
+        let keepalive_handle = tokio::spawn(async move {
+            let interval = std::time::Duration::from_secs(WS_KEEPALIVE_INTERVAL_SECS);
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {}
+                    _ = cancel_rx.changed() => break,
+                }
+                let mut tx = keepalive_tx.lock().await;
+                if tx.send(Message::Ping(Vec::new())).await.is_err() {
+                    break;
+                }
+            }
         });
 
         Ok(Self {
@@ -129,6 +224,7 @@ impl CdpClient {
             event_tx,
             raw_tx,
             _reader_handle: reader_handle,
+            _keepalive_handle: keepalive_handle,
         })
     }
 
@@ -144,7 +240,7 @@ impl CdpClient {
             id,
             method: method.to_string(),
             params,
-            session_id: session_id.map(|s| s.to_string()),
+            session_id: session_id.filter(|s| !s.is_empty()).map(|s| s.to_string()),
         };
 
         let json = serde_json::to_string(&cmd)
@@ -157,6 +253,13 @@ impl CdpClient {
             pending.insert(id, tx);
         }
 
+        // Cleans up the pending entry if this future is cancelled mid-await (#1528).
+        let mut guard = PendingGuard {
+            pending: self.pending.clone(),
+            id,
+            done: false,
+        };
+
         {
             let mut ws_tx = self.ws_tx.lock().await;
             ws_tx
@@ -166,9 +269,16 @@ impl CdpClient {
         }
 
         let response = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
-            Ok(Ok(resp)) => resp,
-            Ok(Err(_)) => return Err("CDP response channel closed".to_string()),
+            Ok(Ok(resp)) => {
+                guard.done = true;
+                resp
+            }
+            Ok(Err(_)) => {
+                guard.done = true;
+                return Err("CDP response channel closed".to_string());
+            }
             Err(_) => {
+                guard.done = true;
                 self.pending.lock().await.remove(&id);
                 return Err(format!("CDP command timed out: {}", method));
             }
@@ -223,6 +333,35 @@ impl CdpClient {
         self.send_command(method, None, session_id).await
     }
 
+    /// Send a CDP command without waiting for its response.
+    ///
+    /// This is useful for best-effort commands where Chrome may not emit a
+    /// response for every target session, but the command still needs to be
+    /// written before the caller can continue processing events.
+    pub async fn send_command_no_wait(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        session_id: Option<&str>,
+    ) -> Result<(), String> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let cmd = CdpCommand {
+            id,
+            method: method.to_string(),
+            params,
+            session_id: session_id.filter(|s| !s.is_empty()).map(|s| s.to_string()),
+        };
+
+        let json = serde_json::to_string(&cmd)
+            .map_err(|e| format!("Failed to serialize CDP command: {}", e))?;
+
+        let mut ws_tx = self.ws_tx.lock().await;
+        ws_tx
+            .send(Message::Text(json))
+            .await
+            .map_err(|e| format!("Failed to send CDP command: {}", e))
+    }
+
     /// Send raw JSON through the WebSocket without tracking a response.
     /// Used by the inspect proxy to forward DevTools frontend messages.
     pub async fn send_raw(&self, json: String) -> Result<(), String> {
@@ -231,6 +370,13 @@ impl CdpClient {
             .send(Message::Text(json))
             .await
             .map_err(|e| format!("Failed to send raw CDP message: {}", e))
+    }
+
+    /// Test-only: count of in-flight commands still awaiting a response, so a
+    /// test can assert a cancelled command left no orphaned entry (#1528).
+    #[cfg(test)]
+    pub(crate) async fn pending_len(&self) -> usize {
+        self.pending.lock().await.len()
     }
 }
 
@@ -264,4 +410,27 @@ impl InspectProxyHandle {
     pub fn subscribe_raw(&self) -> broadcast::Receiver<RawCdpMessage> {
         self.raw_tx.subscribe()
     }
+}
+
+/// Enable TCP SO_KEEPALIVE on the underlying socket of a WebSocket connection.
+/// This is best-effort: failures are silently ignored since the WebSocket-level
+/// Ping keepalive provides the primary connection liveness mechanism.
+fn enable_tcp_keepalive(stream: &tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>) {
+    let tcp_stream = match stream {
+        tokio_tungstenite::MaybeTlsStream::Plain(s) => s,
+        tokio_tungstenite::MaybeTlsStream::Rustls(s) => s.get_ref().0,
+        _ => return,
+    };
+
+    // SockRef borrows the fd without taking ownership.
+    let sock = socket2::SockRef::from(tcp_stream);
+    let keepalive = socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(30));
+
+    // with_interval sets TCP_KEEPINTVL — the time between probes after the
+    // first keepalive probe goes unanswered. Available on most platforms
+    // (Linux, macOS, Windows, FreeBSD, etc.) but not OpenBSD or Haiku.
+    #[cfg(not(any(target_os = "openbsd", target_os = "haiku")))]
+    let keepalive = keepalive.with_interval(std::time::Duration::from_secs(10));
+
+    let _ = sock.set_tcp_keepalive(&keepalive);
 }

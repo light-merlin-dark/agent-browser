@@ -1,5 +1,719 @@
 # agent-browser
 
+## 0.34.0
+
+<!-- release:start -->
+### New Features
+
+- Added **persistent session-to-tab binding for shared Chrome sessions**. Named sessions connected through `--cdp` or `--auto-connect` now remember their CDP target across commands and daemon restarts, and CDP target ids can be used directly as tab references. Start each session with `--pin-tab` to make the binding strict, so a tab closed externally returns a stable `tab_gone` error instead of silently adopting a neighboring tab. JSON output includes `data.targetId` and an optional sanitized `data.lastUrl`; batch exposes the same recovery data under `result` (#1589)
+
+### Improvements
+
+- Added a **Remote Agent Browser provider guide** covering Vercel authentication, disposable and stable sessions, custom VCR images, snapshots, and live-view URLs (#1648)
+
+### Bug Fixes
+
+- Fixed **parallel sessions sharing one Chrome hijacking each other's tabs**. Event-discovered targets no longer steal a pinned session's active tab, re-attach restores the persisted target instead of selecting index 0, and preliminary plus existing-daemon `--cdp` and `--auto-connect` paths preserve explicit pin enable and disable. Agent skill guidance now requires a named `--session` before the first command (#1589)
+- Fixed **`agent-browser doctor` hanging on Chrome version detection**. Windows reads the version from the executable resource table without spawning Chrome; other platforms bound the version subprocess with a deadline, kill, and reap so inherited output handles cannot block forever or leave an orphan browser (#1641)
+
+### Contributors
+
+- @Railly
+- @huozhi
+- @soichisumi
+- @dandaka
+- @mvanhorn
+<!-- release:end -->
+
+## 0.33.2
+
+### New Features
+
+- Added **input priority and per-client delivery settings** to the stream server: each WebSocket connection now splits into a reader task and a writer loop, so clicks and keystrokes dispatch to the browser without queueing behind a frame write. Adds a per-client `{"type":"config","maxFps":N}` cap (1 to 120, `0` uncapped) and opt-in ack pacing via `{"type":"config","pacing":"ack"}` with `{"type":"ack","seq":N}`, which keeps one frame in flight so a stalled client never drains a backlog. Both settings can also be declared on the connection URL (`?pacing=ack&maxFps=10`), the only way to cover the opening frame. Every frame now carries a monotonic `seq` (#1594)
+- Added **configurable stream encoding**: frames were hardcoded to jpeg quality 80 at the session viewport, so frame rate was the only bandwidth lever. `AGENT_BROWSER_STREAM_QUALITY`, `AGENT_BROWSER_STREAM_MAX_WIDTH` and `AGENT_BROWSER_STREAM_MAX_HEIGHT` are read once per daemon and cut bytes without dropping frames: on a busy page at 1280x720, quality 20 takes a frame from 54 KB to 25 KB, and quality 20 at 640x360 takes it to 9 KB, frame rate unchanged in both. Width and height default to the session viewport, so a larger viewport is never downscaled unless both are set (#1626)
+
+### Behavior Changes
+
+- **Frame delivery is now latest-wins.** The stream server holds only the newest frame and reads it at send time, so frames produced while an earlier one is still being written are skipped. A client that assumed it received every frame from the WebSocket now receives fewer. Nothing in this repo consumes the stream that way, since `record` captures through CDP and the dashboard is a viewer, so this affects external consumers only (#1594)
+- **`metadata.timestamp` now carries a real value.** It was always 0, because CDP sends the capture time as a float in seconds and the code read it as an integer. It is now epoch milliseconds, so a client can measure how stale the frame it is drawing is. A client that treated 0 as unknown is unaffected (#1594)
+
+### Bug Fixes
+
+- Fixed **keyboard input over the stream**, which worked in none of the three shapes the docs publish: an absent `key`, `code`, or `text` reached CDP as an explicit null, which rejects the whole command, so every key release and every non-printable key was silently dropped, the dashboard's own payloads included (#1594)
+- Fixed **click latency behind mouse movement**: input dispatch awaited Chrome's reply before reading the next message, so a click sat one round trip behind every queued mouse move. After a 300-event sweep a click landed 2471ms late; it now lands in 6ms (#1627)
+- Fixed **`stream disable`** returning while a slow client's input reader was still running (#1594)
+
+### Contributors
+
+- @Railly
+- @kevingatera
+- @WebCloud
+
+## 0.33.1
+
+### Behavior Changes
+
+- The daemon now ships a **default idle timeout of 1 hour**: after an hour with no commands or dashboard input it saves configured restore state, closes the browser, and exits, so integrations that die without calling `close` no longer leak the daemon and its Chrome tree indefinitely. Sessions without `--restore` or another restore key discard transient browser state and open tabs when they shut down. Set `AGENT_BROWSER_IDLE_TIMEOUT_MS=0` to restore the old always-persist behavior, or any other value to tune it. Dashboard mouse, keyboard, and touch input reset the timer. The default never closes headed browsers, including Safari and iOS WebDriver sessions, or user-attached browsers that may be in direct human use. Provider-owned cloud browsers remain eligible for cleanup, and an explicitly configured timeout applies to all browsers, as before (#1605)
+
+### Bug Fixes
+
+- Fixed **tab recovery and selection** to avoid daemon hangs on Memory Saver-discarded tabs by selecting a live renderer on CDP connect, reviving tabs on switch or after close, treating dialog-blocked tabs as live, preserving refs on rejected operations, and surfacing recovery state across CLI, JSON, and MCP output (#1543)
+- Fixed **a11y selector errors** to report invalid CSS selectors cleanly instead of exposing raw browser evaluation stack traces in text and JSON output (#1604)
+
+### Contributors
+
+- @ctate
+- @Railly
+- @joelhooks
+- @jadenfix
+
+## 0.33.0
+
+### New Features
+
+- Added **axe-core accessibility audits** with `agent-browser a11y [url]`, WCAG tag filtering, selector scoping, iframe-aware text and JSON results, an embedded offline and CSP-safe audit engine, and a matching MCP tool (#1596)
+
+### Contributors
+
+- @ctate
+
+## 0.32.4
+
+### Bug Fixes
+
+- Fixed **find role** to match implicit ARIA roles and browser-computed accessible names through the accessibility tree, so semantic elements like `<h2>` (heading) and `<ul>` (list) resolve, with case-insensitive substring name matching that mirrors Playwright's `getByRole` (#1552)
+- Fixed **element-not-found errors** to preserve the locator detail (selector, role, name, or index) instead of flattening every miss into one generic message, and aligned the advertised `find` actions with the set the dispatcher actually accepts (#1553)
+
+### Contributors
+
+- @Railly
+- @cooleryu
+
+## 0.32.3
+
+### New Features
+
+- Added **HAR response body capture** with text bodies embedded by default and configurable `all`, `text`, and `none` content modes across the CLI and MCP surfaces (#1578)
+- Added a **derive-client skill** for recording browser traffic and generating reusable API clients from HAR request and response data (#1578)
+
+### Contributors
+
+- @ctate
+
+## 0.32.2
+
+### Improvements
+
+- Updated **eve extension packaging** for eve 0.25.1, adopting the new source and dist extension manifest format, updating the eve example to stable AI SDK releases, and keeping extension tests aligned with eve's scoped config registry (#1570)
+
+### Contributors
+
+- @AndrewBarba
+
+## 0.32.1
+
+### Improvements
+
+- Widened **eve compatibility** for `@agent-browser/eve` to accept eve 0.23 and future major releases without peer-resolution warnings (#1563)
+
+### Documentation
+
+- Standardized **eve branding** to use lowercase styling across the docs, examples, package readmes, and release notes (#1557)
+
+### Contributors
+
+- @ctate
+
+## 0.32.0
+
+### New Features
+
+- **eve extension** - Added `@agent-browser/eve`, an eve extension that mounts the agent-browser tool set with namespaced browser tools, sandbox bootstrap helpers, docs, examples, CI, and release packaging (#1547)
+
+### Security
+
+- Hardened **domain allowlists** by blocking WebRTC bypasses, applying network containment across launch modes, workers, popups, restored state, and reused daemon sessions, rejecting unsafe startup arguments, and adding Chrome regression coverage (#1546)
+
+### Bug Fixes
+
+- Fixed **completed-page waits** so load and DOMContentLoaded waits resolve immediately when the current document is already ready, with structured eve wait timeout handling and focused coverage (#1554)
+
+### Contributors
+
+- @ctate
+- @dnukumamras
+
+## 0.31.2
+
+### New Features
+
+- **WebGPU launch preset** - Added `--webgpu` across the CLI, config, environment, and MCP surfaces, with hardware backends on macOS and Windows, software Vulkan on Linux, automatic Xvfb for displayless headed sessions, and a `doctor --webgpu` render and screenshot probe (#1529)
+
+### Improvements
+
+- Added periodic **restore-state autosaves** while the browser remains open, preserving recent state after a browser window is closed by hand and capturing background page changes while honoring the restore save policy. The interval is configurable with `AGENT_BROWSER_AUTOSAVE_INTERVAL_MS` (#1509)
+
+### Contributors
+
+- @ctate
+
+## 0.31.1
+
+### Bug Fixes
+
+- Fixed the **React renderer** so it picks the react-dom renderer instead of hardcoding renderer id 1, which prevented reading an empty tree on Next.js 16.3 Turbopack (#1491)
+
+### Contributors
+
+- @gaojude
+
+## 0.31.0
+
+### New Features
+
+- **Restore workflow** - Added `--restore`, `--restore-save`, restore validation flags, worktree-scoped `session id`, `session info`, and `--namespace` so agent runs can use stable, isolated, automatically restored browser state without managing state files by hand (#1486)
+
+### Improvements
+
+- Hardened **session lifecycle handling** with explicit daemon and browser compatibility checks, lifecycle status output, MCP support for restore options, and safer auto-save behavior that avoids overwriting good state after a failed restore or failed validation (#1486)
+
+### Bug Fixes
+
+- Fixed **restore lifecycle edge cases** around switching restore keys with a live browser, daemon configuration startup races, launch mode validation, and clearing restore failures after an explicit state load (#1486)
+
+### Contributors
+
+- @ctate
+
+## 0.30.1
+
+### Bug Fixes
+
+- Fixed **URL waits** so `wait --url` and `waitforurl` honor glob patterns such as `**/dashboard` against the full active URL (#1483)
+
+### Contributors
+
+- @gaearon
+
+## 0.30.0
+
+### New Features
+
+- **Read command** - Added `agent-browser read [url]` and the matching MCP tool for agent-readable text extraction. URL reads prefer Markdown, try `.md` and nearby `llms.txt` docs, support outlines, filters, raw and JSON output, headers, and domain/output safeguards; omitting the URL reads the rendered active tab DOM with current browser state (#1480)
+
+### Contributors
+
+- @ctate
+
+## 0.29.1
+
+### Improvements
+
+- Defaulted **sandbox system dependency installs** so the eve and Vercel sandbox helpers install Chromium's required libraries unless explicitly disabled, making first-run sandbox setup simpler (#1469)
+
+### Contributors
+
+- @ctate
+
+## 0.29.0
+
+### New Features
+
+- **Sandbox package** - Added `@agent-browser/sandbox` with shared, eve, and Vercel Sandbox helpers, example projects, and docs for running agent-browser in hosted sandbox environments (#1465)
+
+### Improvements
+
+- Updated **sandbox release flow** so the new package stays version-synced with the CLI release and publishes from the correct workspace path (#1465)
+- Reflowed **documentation prose** across the README, docs site, examples, and skills so Markdown and MDX wrap naturally in editors and renderers (#1466)
+
+### Contributors
+
+- @ctate
+
+## 0.28.0
+
+### New Features
+
+- **MCP server** - Added `agent-browser mcp`, a stdio Model Context Protocol server with typed tools, paginated discovery, protocol negotiation, and startup tool profiles. The default `core` profile keeps context small, while `--tools all` exposes full CLI parity and composed profiles such as `core,network,react` are supported (#1454)
+- **Plugin system** - Added out-of-process plugin support over the `agent-browser.plugin.v1` stdio protocol, with `plugin add/list/show/run`, manifest discovery, npm and GitHub refs, credential providers, browser provider plugins, launch mutators, custom command capabilities, config and env registry support, and capability-scoped policy gates (#1452)
+
+### Infrastructure
+
+- Added **context footprint eval coverage** for CLI skills, MCP core, and MCP full-profile surfaces, plus MCP parity tests to keep tool behavior aligned with the CLI (#1454)
+
+### Contributors
+
+- @ctate
+
+## 0.27.3
+
+### Bug Fixes
+
+- Fixed **Windows ARM64 installs** by falling back to the Windows x64 binary during postinstall, avoiding failed downloads for a native ARM64 artifact that is not published (#1269)
+
+### Contributors
+
+- @EternalRights
+
+## 0.27.2
+
+### Bug Fixes
+
+- Fixed **click reliability** by scrolling off-viewport elements into view before resolving coordinates, handling JavaScript dialogs promptly, recovering mouse state after dialog-opening clicks, and detecting click interception by overlays before dispatching input (#1432, #1434)
+- Fixed **frame-scoped selectors and waits** so CSS-selector actions and `wait` respect the selected iframe, including cross-process iframes, with translated click coordinates (#1432)
+- Fixed **wait timeout handling** so the documented 25s default is used, `--timeout` is honored across wait variants, and long waits receive an appropriate client read budget (#1432)
+- Fixed **agent-facing form commands** so `find label` matches `aria-label` and `aria-labelledby`, `select` errors when no option matches, and `type` parses `--clear` and `--delay` instead of typing them as text (#1432)
+
+### Improvements
+
+- Cut **warm CLI command latency** from about 150ms to about 1ms by removing the unconditional daemon settle sleep and retrying once when a stale daemon socket is discovered (#1432)
+- Extended **daemon respawn and retry** handling to batch commands so batches recover from a daemon exit after the initial liveness check (#1432)
+
+### Infrastructure
+
+- Pinned **GNU Linux release artifacts** to glibc 2.28 with zigbuild, added a release guard for newer GLIBC symbols, and aligned Docker release helpers with the pinned target (#1417)
+
+### Contributors
+
+- @ctate
+- @heshamkhaledd
+
+## 0.27.1
+
+### Improvements
+
+- Improved **`vitals` command** output formatting for better readability (#1404)
+
+### Documentation
+
+- Surfaced agent-browser feature coverage in documentation (#1403)
+
+## 0.27.0
+
+### New Features
+
+- **React introspection** - First-class React DevTools integration with new `react tree`, `react inspect <fiberId>`, `react renders start|stop`, and `react suspense` commands for full component-tree visibility, per-fiber props/hooks/state inspection, render profiling with mount/re-render counts and change details, and Suspense boundary classification with root-cause grouping and recommendations. React DevTools hook is vendored (MIT) and embedded in the binary with zero runtime dependencies (#1257)
+- **Web Vitals** - New `vitals [url]` command that reports Core Web Vitals (LCP, CLS, TTFB, FCP, INP) plus React hydration phases for any page (#1257)
+- **SPA navigation** - New `pushstate <url>` command for client-side SPA navigations without a full page load (#1257)
+- **Init scripts and feature flags** - New `--init-script <path>` flag (repeatable; env `AGENT_BROWSER_INIT_SCRIPTS`) to register scripts before first navigation, and `--enable <feature>` flag (repeatable; env `AGENT_BROWSER_ENABLE`) for built-in init scripts such as `react-devtools` (#1257)
+- **Network route resource type filter** - `network route` now accepts `--resource-type <csv>` to filter intercepted requests by CDP resource type (#1257)
+- **cURL cookie import** - `cookies set --curl <file>` auto-detects JSON, cURL, and Cookie-header formats for bulk cookie import (#1257)
+- **Dashboard proxy support** - The observability dashboard now works from proxied origins via a same-origin proxy, enabling deployment behind reverse proxies and path-based routing (#1111)
+
+### Bug Fixes
+
+- Fixed **`doctor` command** generating duplicate check ids when called multiple times in the same process (#1330)
+
+### Infrastructure
+
+- Switched npm publishing to **trusted publishing** via GitHub Actions OIDC, removing the need for manually managed npm tokens (#1273)
+
+### Contributors
+
+- @ctate
+- @quuu
+- @shaper
+- @ThomasK33
+
+## 0.26.0
+
+### New Features
+
+- **`doctor` command** - Added `agent-browser doctor` for one-shot diagnosis of an install. Checks environment, Chrome, running daemons, config files, security, providers, and network connectivity; auto-cleans stale daemon sidecar files on every run; and performs a live headless launch test. Supports `--offline` to skip network probes, `--quick` to skip the launch test, `--fix` for opt-in repairs (install missing Chrome, close version-mismatched daemons, prune expired state files), and `--json` for structured output (#1254)
+- **Stable tab ids and labels** - Tabs now have stable string ids like `t1`, `t2`, `t3` that don't shift when other tabs close or popups appear. Tabs can be created with a memorable label via `tab new --label <name> [<url>]`, and labels are interchangeable with `t<N>` ids everywhere a tab ref is accepted (`tab <id|label>`, `tab close <id|label>`). Bare-integer input is rejected with a teaching error so agents can't mistake stable handles for positional indices (#892, #1249, #1250)
+- **`core` skill** - Renamed the built-in `agent-browser` skill to `core` and replaced its ~40-line discovery stub with a ~420-line usage guide covering the core snapshot-ref-act loop, reading, interacting, waiting, common workflows, troubleshooting, and global flags. `agent-browser skills get core` now returns content agents can use directly; `--full` adds references and templates. Added a `hidden:` frontmatter flag so the original `agent-browser` stub stays reachable for `npx skills add` discovery without polluting `skills list` (#1253)
+- **JSON Schema for config files** - Added `agent-browser.schema.json` describing every config option with types and descriptions, enabling IDE autocomplete and validation when referenced via `$schema` in `agent-browser.json` or `~/.agent-browser/config.json`. The schema is served from the docs site at `https://agent-browser.dev/schema.json` (#1242, #1248)
+
+### Bug Fixes
+
+- Fixed **`--state` / `AGENT_BROWSER_STATE`** not actually loading saved browser state (cookies and localStorage) at launch. The flag had been fully plumbed through parsing, env propagation, and validation since the native Rust rewrite, but the load step was never wired up. Storage state now loads after launch across all four paths: explicit launch, auto-connect, provider, and local Chrome (#1241)
+
+### Documentation
+
+- `--help` output now shows the **skills** section first so agents discover `skills get core` (the canonical usage guide) before the core command list (#1251)
+
+### Contributors
+
+- @ctate
+- @DJRHails
+- @michael-farah
+- @tomdale
+
+## 0.25.5
+
+### Bug Fixes
+
+- Fixed **`--auto-connect` CDP discovery** preferring HTTP endpoint discovery over the DevToolsActivePort websocket path, which could fail on some setups. The CLI now reads the websocket path from DevToolsActivePort first and only falls back to HTTP discovery (#1218)
+- Fixed **recording context viewport** not inheriting the active viewport dimensions, causing recordings to use default resolution instead of the configured viewport (#1208)
+- Fixed **`get box` and `get styles`** printing no data in text mode (#1231, #1233)
+- Fixed **active page changing** when closing or removing earlier tabs. The previously focused page is now preserved correctly (#1220)
+
+### Contributors
+
+- @ctate
+- @jin-2-kakaoent
+- @officialasishkumar
+
+## 0.25.4
+
+### New Features
+
+- **`skills` command** - Added `agent-browser skills` command for discovering and installing agent skills, with built-in evaluation support for testing skills against live browser sessions (#1225, #1227)
+
+### Bug Fixes
+
+- Fixed **custom viewport dimensions** not being used in streaming frame metadata and image resolution (#1033)
+- Fixed **`--ignore-https-errors`** not being re-applied to recording contexts, causing TLS errors during screen recordings (#1178)
+- Fixed **duplicate option numbering** in the auth skill documentation (#1161)
+
+### Documentation
+
+- The docs site header now **dynamically fetches** the GitHub star count (#1202)
+
+### Contributors
+
+- @ctate
+- @jin-2-kakaoent
+- @juniper929
+- @Marshall-Sun
+
+## 0.25.3
+
+### Bug Fixes
+
+- Fixed **hidden radio/checkbox inputs missing from snapshot refs** when a `<label>` wraps a `display:none` `<input type="radio">` or `<input type="checkbox">`. Chrome excludes these inputs from the accessibility tree entirely, making it impossible for AI agents to identify radio buttons and checkboxes via refs. Hidden inputs inside elements are now detected during cursor-interactive scanning and their parent nodes are promoted to the correct role with proper name and checked state (#1085)
+
+### Documentation
+
+- Added **clickable heading anchors** to the docs site, making it easy to link directly to any section (#1175)
+
+### Contributors
+
+- @ctate
+- @jin-2-kakaoent
+- @hyunjinee
+
+## 0.25.2
+
+### Bug Fixes
+
+- Fixed **Chrome being killed after ~10s idle on Linux** caused by `PR_SET_PDEATHSIG` tracking the blocking thread that spawned Chrome rather than the daemon process. When Tokio reaped the idle thread, the kernel sent SIGKILL to Chrome even though the daemon was still alive. Orphan cleanup is handled by the existing process-group kill in `ChromeProcess::kill()` (#1157, #1173)
+
+### Contributors
+
+- @ctate
+
+## 0.25.1
+
+### Improvements
+
+- **Embedded dashboard** - The observability dashboard is now bundled directly into the CLI binary using `rust-embed`, eliminating the need for `dashboard install`. The dashboard is available immediately after installing agent-browser (#1169)
+
+### Contributors
+
+- @ctate
+
+## 0.25.0
+
+### New Features
+
+- **AI chat command** - Added `chat` command for AI-powered browser automation. Supports single-shot mode (`chat "open google.com"`) and an interactive REPL. The AI agent can execute any agent-browser command via tool calls. Requires `AI_GATEWAY_API_KEY`. Configure the model with `--model` or `AI_GATEWAY_MODEL` (#1160, #1163)
+- **Dashboard AI chat** - The observability dashboard now includes a built-in AI chat interface for conversational browser control alongside live session views (#1160, #1163)
+- **`snapshot --urls`** - New `-u`/`--urls` flag to include href URLs for link elements in snapshot output, giving agents direct access to link targets without additional queries (#1160)
+- **Batch argument mode** - The `batch` command now accepts commands as inline arguments in addition to reading from stdin, simplifying single-invocation multi-command workflows (#1160)
+
+### Bug Fixes
+
+- Fixed **`getByRole`** matching wrong elements (e.g. `<link>` stylesheet elements instead of `<a>` anchors) by rewriting the implementation to use the CDP accessibility tree with ref-based element resolution instead of CSS selectors (#1145)
+- Fixed **`upload` command** not supporting accessibility tree refs (`@eN`) for file upload element selection (#1156)
+- Fixed **`AGENT_BROWSER_DEFAULT_TIMEOUT`** not being applied to `wait` commands. The environment variable now propagates to all wait variants (`wait`, `wait --url`, `wait --text`, `wait --load`, `wait --fn`, `wait --download`) (#1153)
+- Fixed **dashboard download** error handling with improved retry logic for more reliable dashboard installation (#1154)
+
+### Tests
+
+- Fixed CI test failures on Windows and E2E (#1165)
+
+### Contributors
+
+- @ctate
+- @jin-2-kakaoent
+- @hyunjinee
+
+## 0.24.1
+
+### New Features
+
+- **Chrome profile login state reuse** - `--profile <name>` now resolves Chrome profile names (e.g. `Default`, `Profile 1`) and copies the profile to a temp directory to reuse login state, cookies, and extensions without modifying the original. Added `profiles` command to list available Chrome profiles with `--json` support (#1131)
+
+### Bug Fixes
+
+- Fixed **`--ignore-https-errors`** not passing `--ignore-certificate-errors` as a Chrome launch flag, causing TLS errors like `ERR_SSL_PROTOCOL_ERROR` to be rejected at the network layer before CDP could intervene (#1132)
+- Fixed **orphaned Chrome processes** on daemon exit by spawning Chrome in its own process group and killing the entire group on shutdown. On Linux, `PR_SET_PDEATHSIG` ensures Chrome is killed even if the daemon is OOM-killed (#1137)
+- Fixed **CDP attach hang on Chrome 144+** when connecting to real browser sessions. Targets paused waiting for the debugger after attach are now resumed with `Runtime.runIfWaitingForDebugger` (#1133)
+- Fixed **stale daemon after upgrade** silently reusing the old daemon process with broken CDP behavior. The daemon now writes a `.version` sidecar file and auto-restarts on version mismatch (#1134)
+- Fixed **stale daemon/socket recovery** where `close --all` failed to clean up zombie daemons and stale files. Unreachable daemons are now force-killed and orphaned socket/pid files are removed (#1136)
+- Fixed **idle timeout** not being respected because the sleep future was recreated on every select loop iteration, preventing the deadline from being reached (#1110)
+- Fixed **browser not relaunching** when launch options change (e.g. adding extensions to `config.json`) between consecutive launch commands (#996)
+- Fixed **`auto_launch()`** not honouring `AGENT_BROWSER_PROVIDER` for cloud providers, causing non-launch commands to fall back to local Chrome instead of connecting via the provider API (#1126)
+- Fixed **HAR capture missing API requests** under heavy traffic by increasing the CDP broadcast buffer from 256 to 4096 events, reducing the drain interval from 500ms to 100ms, and enabling network tracking in cross-origin iframes (#1135)
+
+### Tests
+
+- Fixed **`e2e_relaunch_on_options_change`** launching headed Chrome on CI where no display is available. The test now stays headless and only changes extensions to trigger the relaunch (#996)
+- Fixed **`e2e_auth_login`** flake by reducing the SPA render delay from 1200ms to 800ms, giving more headroom within the selector wait window on slower CI runners
+
+### Contributors
+
+- @ctate
+- @desenmeng
+- @jin-2-kakaoent
+- @snese
+
+## 0.24.0
+
+### New Features
+
+- **AWS Bedrock AgentCore provider** - Added AWS Bedrock AgentCore as a cloud browser provider. Connect with `--provider agentcore` or `AGENT_BROWSER_PROVIDER=agentcore`. Uses lightweight manual SigV4 signing for authentication with support for the full AWS credential provider chain (environment variables, AWS CLI, SSO, IAM roles). Configure with `AGENTCORE_REGION`, `AGENTCORE_PROFILE_ID`, and `AGENTCORE_BROWSER_ID` environment variables. Returns session ID and Live View URL in the launch response (#397)
+
+### Documentation
+
+- Added AgentCore provider page to docs site, README options table, SKILL.md, and dashboard provider icons (#1120)
+
+### Contributors
+
+- @ctate
+- @pahud
+
+## 0.23.4
+
+### Bug Fixes
+
+- Fixed **daemon hang on Linux** caused by a `waitpid(-1)` race condition in the SIGCHLD handler that stole exit statuses from Rust's `Child` handles, leaving the daemon in a broken state. Replaced the global signal handler with targeted crash detection via the existing drain interval (#1098)
+
+## 0.23.3
+
+### Bug Fixes
+
+- Fixed **drag and drop** not working because `mouseMoved` events during the drag omitted the `buttons` bitmask, causing the browser to see `event.buttons === 0` and never fire `dragstart`/`dragover`/`drop` (#1087)
+
+## 0.23.2
+
+### Patch Changes
+
+- 3c942e2: ### New Features
+
+  - **Dashboard session creation** - Sessions can now be created directly from the dashboard UI. A new session dialog provides a unified selector grid for local engines (Chrome, Lightpanda) and cloud providers (Browserbase, Browserless, Browser Use, Kernel) with async creation, loading state, and error display (#1092)
+  - **Dashboard provider icons** - The session sidebar now shows the provider or engine icon for each session, making it easy to identify which backend a session is using (#1092)
+
+  ### Bug Fixes
+
+  - Fixed **Browser Use** provider using an intermediate API call instead of connecting directly via WSS (`wss://connect.browser-use.com`), which caused connection failures (#1092)
+  - Fixed **Browserbase** provider not sending an explicit JSON body and `Content-Type` header, causing session creation to fail (#1092)
+  - Fixed **provider navigation** hanging because `wait_for_lifecycle` waited for page load events that remote providers may not emit. Navigation with `--provider` now automatically sets `waitUntil=none` (#1092)
+  - Fixed **remote CDP connections** timing out by increasing the CDP connect timeout from 10s to 25s for cloud providers (#1092)
+  - Fixed **zombie daemon processes** not being cleaned up when a provider connection fails during session creation from the dashboard (#1092)
+
+## 0.23.1
+
+### Patch Changes
+
+- fbcab37: ### New Features
+
+  - **Auto-dismissal for alert and beforeunload dialogs** - JavaScript `alert()` and `beforeunload` dialogs are now automatically accepted to prevent the agent from blocking indefinitely. `confirm` and `prompt` dialogs still require explicit `dialog accept/dismiss` commands. Disable with `--no-auto-dialog` flag or `AGENT_BROWSER_NO_AUTO_DIALOG` environment variable (#1075)
+  - **Puppeteer browser cache fallback** - Chrome discovery now searches `~/.cache/puppeteer/chrome/` (or `PUPPETEER_CACHE_DIR`) for Chrome binaries, so users with an existing Puppeteer installation can use agent-browser without a separate install step (#1088)
+  - **Console output improvements** - `console.log` of objects now shows the actual object preview (e.g. `{userId: "abc", count: 42}`) instead of `"Object"`. JSON output includes a raw `args` array for programmatic access (#1040)
+
+  ### Bug Fixes
+
+  - Fixed **same-document navigation** (e.g. SPA hash routing) hanging forever because `wait_for_lifecycle` waited for a `Page.loadEventFired` that never fires on same-document navigations (#1059)
+  - Fixed **save_state** only capturing cookies and localStorage for the current origin, silently dropping cross-domain data (e.g. SSO/CAS auth cookies). Now uses `Network.getAllCookies` and collects localStorage from all visited origins (#1064)
+  - Fixed **externally opened tabs** not appearing in `tab list` when using `--cdp` mode. Tabs opened by the user or another CDP client are now detected and tracked (#1042)
+  - Fixed **dashboard server** not picking up installed files without a restart. `dashboard install` now takes effect immediately on a running server (#1066)
+  - Fixed **Windows Chrome extraction** failing because zip path normalization used forward slashes while the extraction code expected backslashes (#1088)
+
+## 0.23.0
+
+### Minor Changes
+
+- 0f0f300: ### New Features
+
+  - **Observability dashboard** - Added a local web UI (`dashboard`) that shows live browser viewports, command activity feeds, console output, network requests, storage, and extensions for all sessions. Manage it with `dashboard start`, `dashboard stop`, and `dashboard install`. The dashboard runs as a standalone background process and all sessions stream to it automatically (#1034)
+  - **Runtime stream management** - Added `stream enable`, `stream disable`, and `stream status` commands to control WebSocket streaming at runtime. Streaming is now always enabled by default; `AGENT_BROWSER_STREAM_PORT` overrides the port instead of toggling the feature (#951)
+  - **Close all sessions** - Added `close --all` flag to close every active browser session at once
+
+  ### Bug Fixes
+
+  - Fixed **Lightpanda engine** compatibility (#1050)
+  - Fixed **Windows daemon TCP bind** failing when Hyper-V reserves the port by falling back to an OS-assigned port and writing it to a `.port` file (#1041)
+  - Fixed **Windows dashboard relay** using Unix socket instead of TCP (#1038)
+  - Fixed **radio/checkbox elements** being dropped from compact snapshot tree because the `ref=` check required a leading `[` that those elements lack (#1008)
+
+## 0.22.3
+
+### Patch Changes
+
+- eb64ca4: ### Bug Fixes
+
+  - **Re-apply download behavior on recording context** - Fixed an issue where downloads were silently dropped in recording contexts because `Browser.setDownloadBehavior` set at launch only applied to the default context. The download behavior is now re-applied when a new recording context is created (#1019)
+  - **Reap zombie Chrome process and fast-detect crash for auto-restart** - Added a non-blocking process-exit check before attempting CDP connection checks. This prevents a 3-second CDP timeout when Chrome has already crashed or exited, enabling faster detection and auto-restart of the browser (#1023)
+  - **Route keyboard `type` through text input** - Fixed keyboard `type` subaction to correctly route through the text input handler, and added support for an `insertText` subaction using `Input.insertText` (#1014)
+  - **Handle `--clear` flag in `console` command** - Fixed the `console` command to accept and process a `clear` parameter, allowing console event history to be cleared (#1015)
+
+## 0.22.2
+
+### Patch Changes
+
+- a098197: ### New Features
+
+  - **Dialog status command** - Added `dialog status` command to check whether a JavaScript dialog is currently open (#999)
+  - **Dialog warning field** - Command responses now include a `warning` field when a JavaScript dialog is pending, indicating the dialog type and message (#999)
+
+  ### Improvements
+
+  - **Standard proxy environment variables** - The proxy setting now automatically falls back to standard environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and their lowercase variants), with `NO_PROXY`/`no_proxy` respected for bypass rules (#1000)
+  - **Font packages for `--with-deps`** - Installing with `--with-deps` now includes CJK and emoji font packages on Linux (Debian, RPM, and yum-based distros) to prevent missing glyphs when rendering international content (#1002)
+
+  ### Bug Fixes
+
+  - Fixed `state show` always failing with "Missing 'path' parameter" due to a mismatched JSON field name (`filename` → `path`) (#994)
+  - Fixed `console` command returning only `Done` due to a JSON field name mismatch in the response (#986)
+  - Fixed browser-domain CDP events being dropped during downloads due to a `sessionId` mismatch (#998)
+  - Fixed proxy authentication by handling credentials via the CDP `Fetch.authRequired` event rather than passing them inline (#1000)
+
+## 0.22.1
+
+### Patch Changes
+
+- 3a3317b: ### Bug Fixes
+
+  - Fixed **modifier key chords** (e.g. `Control+a`, `Shift+Enter`, `Control+Shift+a`) not being handled correctly when using `press`. Modifier keys (`Alt`, `Control`/`Ctrl`, `Meta`/`Cmd`, `Shift`) are now parsed and forwarded as CDP modifier bitmasks rather than treated as part of the key name (#980)
+  - Fixed **query parameters being dropped** from `--cdp` HTTP URLs (e.g. `http://host:9222?mode=Hello`). Query strings are now preserved and forwarded to the remote CDP endpoint (#982)
+
+## 0.22.0
+
+### Minor Changes
+
+- be30bc9: ### New Features
+
+  - **Cross-origin iframe support** - Added support for snapshots and interactions within cross-origin iframes via `Target.setAutoAttach` (#949)
+  - **Network request detail and filtering** - Added `network request <requestId>` command to view full request/response detail, and new filtering options for `network requests` including `--type` (e.g. `xhr,fetch`), `--method` (e.g. `POST`), and `--status` (e.g. `2xx`, `400-499`) (#935)
+
+  ### Improvements
+
+  - **Snapshot usability** - Reduced AI cognitive load by filtering semantic noise from snapshot output; cursor-interactive elements are now included by default, making the `-C` flag unnecessary (#968)
+  - **Upgrade command** - Improved robustness of installation method detection in the upgrade command (#960)
+  - **Target tracking** - Enhanced target tracking and page information handling for more reliable browser session management (#969)
+
+  ### Bug Fixes
+
+  - Fixed **viewport dimensions** being reported incorrectly in streaming status messages and screencast (#952)
+  - Fixed **`find` command** flags such as `--exact` and `--name` leaking into fill values when used with fill actions (#955)
+  - Fixed **state commands** incorrectly starting the daemon when no `session_name` is provided (#677, #964)
+  - Fixed **auto-connect** triggering when the daemon is already running, preventing duplicate connections (#971)
+  - Fixed **Enter key press** not working by adding a text field to `keyDown` events (#972)
+  - Fixed **download command** to properly handle absolute paths and correctly click target elements (#970)
+
+  ### Breaking Changes
+
+  - The `-C` / `--cursor` flag for `snapshot` is deprecated; cursor-interactive elements are now included by default and the flag has no additional effect (#968)
+
+  ### Documentation
+
+  - Updated `README.md` with new `network requests` filtering options and `network request <requestId>` command usage
+  - Removed references to the deprecated `-C` / `--cursor` snapshot flag from docs and command reference
+
+## 0.21.4
+
+### Patch Changes
+
+- aed466b: ### Bug Fixes
+
+  - **Auth login readiness** - `agent-browser auth login` now navigates with `load`, waits for usable login form selectors, and uses staged username detection (targeted email/username selectors first, then broad text-input fallback). This reduces SPA timing failures, avoids false matches on unrelated text fields, and prevents `networkidle` hangs on pages with continuous background requests.
+
+## 0.21.3
+
+### Patch Changes
+
+- 6daad22: ### Bug Fixes
+
+  - **WebSocket keepalive for remote browsers** - Added WebSocket Ping frames and TCP `SO_KEEPALIVE` to prevent CDP connections from being silently dropped by intermediate proxies (reverse proxies, load balancers, service meshes) during idle periods (#936)
+  - **XPath selector support** - Fixed element resolution to correctly handle the `xpath=` selector prefix (#908)
+
+  ### Performance
+
+  - **Fast-path for identical snapshots** - Short-circuits the Myers diff algorithm when comparing a snapshot to itself, avoiding unnecessary computation in retry and loop workloads where repeated identical snapshots are common (#922)
+
+  ### Documentation
+
+  - Migrated page metadata from MDX files to `layout.tsx` (#904)
+  - Added search functionality and color improvements to docs (#927)
+  - Fixed desktop browser list in the iOS comparison table (#926)
+  - Created a new `providers/` section with dedicated provider pages (#928)
+
+## 0.21.2
+
+### Patch Changes
+
+- 757626f: ### Bug Fixes
+
+  - **Deduplicate text content in snapshots** - Fixed an issue where duplicate text content appeared in page snapshots (#909)
+  - **Native mouse drag state** - Fixed incorrect raw native mouse drag state not being properly tracked across `down`, `move`, and `up` events (#872)
+  - **Chrome headless launch failures** - Fixed browser launch failures caused by the `--enable-unsafe-swiftshader` flag in Chrome headless mode (#915)
+  - **Origin-scoped `--headers` persistence** - Restored correct persistence of origin-scoped headers set via `--headers` across navigation commands (#894)
+  - **Relative URLs in WebSocket domain filter** - Fixed handling of relative URLs in the WebSocket domain filter script (#624)
+
+## 0.21.1
+
+### Patch Changes
+
+- 1e7619d: ### New Features
+
+  - **HAR 1.2 network capture** - Added commands to capture and export network traffic in HAR 1.2 format, including accurate request/response timing, headers, body sizes, and resource types sourced from Chrome DevTools Protocol events (#864)
+  - **Built-in `upgrade` command** - Added `agent-browser upgrade` to self-update the CLI; automatically detects your installation method (npm, Homebrew, or Cargo) and runs the appropriate update command (#898)
+
+  ### Documentation
+
+  - Added `upgrade` command to the README command reference and installation guide
+  - Added a dedicated **Updating** section to the README with usage instructions for `agent-browser upgrade`
+
+## 0.21.0
+
+### Minor Changes
+
+- c6de80b: ### New Features
+
+  - **`batch` command** -- Execute multiple commands from stdin in a single invocation. Accepts a JSON array of string arrays and returns results sequentially. Supports `--bail` to stop on first error and `--json` for structured output (#865)
+  - **iframe support** -- CLI interactions and snapshots now traverse into iframe content, enabling automation of cross-frame pages (#869)
+  - **`network har start/stop` command** -- Capture and export network traffic in HAR 1.2 format (#874)
+  - **WebSocket fallback for CDP discovery** -- When HTTP-based CDP endpoint discovery fails, the CLI now falls back to a WebSocket connection automatically (#873)
+
+  ### Improvements
+
+  - **`--full`/`-f` refactored to command-level flag** -- Moved from a global flag to a per-command flag for clearer scoping (#877)
+  - **Enhanced Chrome launch** -- Added `--user-data-dir` support and configurable launch timeout for more reliable browser startup (#852)
+
+  ### Bug Fixes
+
+  - Fixed `/json/list` fallback when `/json/version` endpoint is unavailable, improving compatibility with non-standard CDP implementations (#861)
+  - Fixed daemon liveness detection for PID namespace isolation (e.g. `unshare`). Uses socket connectivity as the sole liveness check instead of `kill(pid, 0)`, which fails when the caller cannot see the daemon's PID (#879)
+  - Fixed Ubuntu dependency install accidentally removing system packages (#884)
+
+## 0.20.14
+
+### Patch Changes
+
+- c0d4cf6: ### New Features
+
+  - **Idle timeout for daemon auto-shutdown** - Added `--idle-timeout` CLI flag (and `AGENT_BROWSER_IDLE_TIMEOUT_MS` environment variable) to automatically shut down the daemon after a period of inactivity. Accepts human-friendly formats such as `10s`, `3m`, `1h`, or raw milliseconds (#856)
+  - **Cursor-interactive elements in snapshot tree** - Cursor-interactive elements are now embedded directly into the snapshot tree for richer context (#855)
+
+  ### Bug Fixes
+
+  - Fixed **remote host support** in CDP discovery, enabling connection to browsers running on non-local hosts (#854)
+  - Fixed **CDP flag propagation** to the daemon process, ensuring reliable CDP reconnection across sessions (#857)
+  - Fixed **Windows auto-connect profiling** to correctly handle browser connection on Windows (#835, #840)
+  - Fixed **Windows transient error detection** by recognising Windows-specific socket error codes (`os error 10061` connection refused, `os error 10054` connection reset) during daemon reconnection attempts
+
 ## 0.20.13
 
 ### Patch Changes
