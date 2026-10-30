@@ -566,6 +566,10 @@ agent-browser removeinitscript <identifier>       # Remove from every tab in the
 
 Runtime init-script identifiers are session-wide. `removeinitscript` removes the script from every open tab where it was registered and prevents it from being replayed into tabs opened later.
 
+### Site analytics opt-out
+
+agent-browser is not a reader, so it stays out of the analytics of the sites it visits. Every tab it opens or attaches to (headed, headless, persistent profiles, CDP and auto-connect, popups) sets Umami's own opt-out, `localStorage["umami.disabled"]`, before any page script runs. Umami's tracker checks that key before every send, wherever the tracker is served from. To test a site's analytics itself, start the session with `AGENT_BROWSER_SITE_ANALYTICS=live`; live mode removes the key, so a persistent profile that earlier sessions opted out counts again. The switch is read when the session's daemon starts, so `close` a running session before changing it.
+
 ### Setup
 
 ```bash

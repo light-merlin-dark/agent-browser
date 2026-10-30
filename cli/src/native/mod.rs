@@ -35,6 +35,8 @@ pub mod recording;
 #[allow(dead_code)]
 pub mod screenshot;
 #[allow(dead_code)]
+pub mod site_analytics;
+#[allow(dead_code)]
 pub mod snapshot;
 #[allow(dead_code)]
 pub mod state;

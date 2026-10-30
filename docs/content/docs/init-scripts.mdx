@@ -21,6 +21,19 @@ agent-browser open https://example.com
 
 Launch-time scripts are applied when the browser starts. If the daemon is already running, close it before changing launch-time script options.
 
+## Site analytics opt-out
+
+agent-browser is not a reader, so every tab it opens or attaches to sets Umami's own opt-out, `localStorage["umami.disabled"]`, before any page script runs. This covers headed and headless launches, persistent profiles, CDP and auto-connect sessions (including tabs that were already open), and popups. Umami's tracker checks the key before every send, wherever the tracker is served from.
+
+To test a site's analytics itself, opt the session back in:
+
+```bash
+agent-browser close
+AGENT_BROWSER_SITE_ANALYTICS=live agent-browser --headed open https://example.com
+```
+
+Live mode removes the key, so a persistent profile that earlier sessions opted out counts again.
+
 ## Built-in scripts
 
 ```bash

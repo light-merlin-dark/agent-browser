@@ -14330,10 +14330,12 @@ async fn e2e_state_load_keeps_storage_away_from_page_scripts_and_redirects() {
         )
         .await,
     );
+    // The site-analytics opt-out key is agent-browser's own, set on every
+    // origin; nothing from the loaded state may be there.
     assert_evaluate(
         &mut state,
         "6",
-        "localStorage.length + sessionStorage.length",
+        "Object.keys(localStorage).filter((key) => key !== 'umami.disabled').length + sessionStorage.length",
         json!(0),
     )
     .await;
@@ -14342,4 +14344,169 @@ async fn e2e_state_load_keeps_storage_away_from_page_scripts_and_redirects() {
     other_server.abort();
     redirect_server.abort();
     hook_server.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Site analytics opt-out
+// ---------------------------------------------------------------------------
+
+/// Serves a page whose inline script is the gate Umami's tracker runs before
+/// every send (`localStorage.getItem("umami.disabled")`), at parse time, so a
+/// key that arrives after page scripts start fails the test. Returns the port,
+/// the request log, and the server task.
+async fn serve_umami_gate() -> (u16, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+    let requests_for_server = requests.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let requests = requests_for_server.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let request_line = request.lines().next().unwrap_or("").to_string();
+                let body = r#"<!doctype html><script>
+                    if (!localStorage.getItem("umami.disabled")) {
+                      fetch("/api/send?page=" + encodeURIComponent(location.pathname), { method: "POST" });
+                    }
+                    document.title = localStorage.getItem("umami.disabled") ? "disabled" : "sent";
+                  </script><a id="popup" href="/popup" target="_blank">popup</a>"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                if let Ok(mut logged) = requests.lock() {
+                    logged.push(request_line);
+                }
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+    (port, requests, server)
+}
+
+fn umami_sends(requests: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+    requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|line| line.contains("/api/send"))
+        .cloned()
+        .collect()
+}
+
+/// Every document agent-browser loads carries Umami's opt-out before its first
+/// script: the launch page, a navigation, a page-opened popup, and `tab new`.
+#[tokio::test]
+#[ignore]
+async fn e2e_site_analytics_opted_out_on_every_document() {
+    let env = EnvGuard::new(&[super::site_analytics::SITE_ANALYTICS_ENV]);
+    env.remove(super::site_analytics::SITE_ANALYTICS_ENV);
+    let (port, requests, server) = serve_umami_gate().await;
+    let base = format!("http://127.0.0.1:{port}");
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": format!("{base}/first") }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_evaluate(&mut state, "3", "document.title", json!("disabled")).await;
+
+    // localStorage is per origin and persists, so clear it before each new
+    // document: every document must set the key itself.
+    let clear_storage = json!({ "action": "evaluate", "script": "localStorage.clear()" });
+    assert_success(&execute_command(&clear_storage, &mut state).await);
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "click", "selector": "#popup" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    assert_success(&execute_command(&clear_storage, &mut state).await);
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "tab_new", "url": format!("{base}/tab") }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_evaluate(&mut state, "6", "document.title", json!("disabled")).await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let lines = requests.lock().unwrap().clone();
+    assert!(
+        lines.iter().any(|line| line.contains(" /popup ")),
+        "the popup should have loaded: {lines:?}"
+    );
+    assert_eq!(umami_sends(&requests), Vec::<String>::new());
+
+    let _ = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    server.abort();
+}
+
+/// `AGENT_BROWSER_SITE_ANALYTICS=live` opts a session back in, and removes a
+/// key an earlier session left in a persistent profile.
+#[tokio::test]
+#[ignore]
+async fn e2e_site_analytics_live_counts_again() {
+    let env = EnvGuard::new(&[super::site_analytics::SITE_ANALYTICS_ENV]);
+    env.set(super::site_analytics::SITE_ANALYTICS_ENV, "live");
+    let (port, requests, server) = serve_umami_gate().await;
+    let base = format!("http://127.0.0.1:{port}");
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": format!("{base}/first") }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_evaluate(&mut state, "3", "document.title", json!("sent")).await;
+
+    let resp = execute_command(
+        &json!({
+            "id": "4", "action": "evaluate",
+            "script": "localStorage.setItem('umami.disabled', '1')",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "navigate", "url": format!("{base}/second") }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_evaluate(&mut state, "6", "document.title", json!("sent")).await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(umami_sends(&requests).len(), 2);
+
+    let _ = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    server.abort();
 }

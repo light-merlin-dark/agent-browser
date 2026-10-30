@@ -36,6 +36,7 @@ use super::providers;
 use super::react;
 use super::recording::{self, RecordingState};
 use super::screenshot::{self, ScreenshotOptions};
+use super::site_analytics;
 use super::snapshot::{self, SnapshotOptions};
 use super::state;
 use super::storage;
@@ -1082,6 +1083,14 @@ impl DaemonState {
                             Ok(())
                         };
 
+                        // A popup or new tab is still paused here, so the
+                        // analytics opt-out lands before its first document.
+                        if target_info.as_ref().is_some_and(|target| {
+                            should_track_target(target) || target.target_type == "iframe"
+                        }) {
+                            let _ = site_analytics::queue_on_new_documents(&client, &sid).await;
+                        }
+
                         if controls_result.is_ok() {
                             let _ = client
                                 .send_command_no_wait(
@@ -1622,6 +1631,8 @@ impl DaemonState {
                         te.target_info.title.clone(),
                         te.target_info.target_type.clone(),
                     );
+                    let _ = site_analytics::queue_on_new_documents(&mgr.client, &attach.session_id)
+                        .await;
                     mgr.resume_if_waiting_pub(&attach.session_id).await
                 }
                 .await
@@ -4181,13 +4192,6 @@ async fn browser_use_setup_timeout(state: &mut DaemonState) -> String {
     }
 }
 
-/// True when [`apply_session_setup`] has anything to replay onto a new tab.
-async fn session_setup_pending(state: &DaemonState) -> bool {
-    !state.session_setup.is_empty()
-        || !state.routes.read().await.is_empty()
-        || !state.origin_headers.read().await.is_empty()
-}
-
 /// Replay the session-scoped setup the user configured on the active page
 /// (see [`SessionSetup`]) onto a tab the daemon just created, plus the
 /// `Fetch.enable` needed for `route` and origin-scoped `--headers` to reach
@@ -4205,6 +4209,8 @@ async fn apply_session_setup(state: &mut DaemonState, session_id: &str) -> Resul
         .client
         .clone();
     let setup = state.session_setup.clone();
+
+    let _ = site_analytics::queue_on_new_documents(&client, session_id).await;
 
     if let Some(ref ua) = setup.user_agent {
         let _ = client
@@ -4600,11 +4606,34 @@ async fn auto_launch_inner(
     state.start_dialog_handler();
     state.update_stream_client().await;
     install_network_controls_or_close(state, has_proxy_auth).await?;
+    pause_new_tabs_for_setup(state).await;
 
     apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
     try_auto_restore_state(state).await;
     try_load_storage_state(state, &storage_state_path).await;
     Ok(())
+}
+
+/// A browser the daemon launched itself has no human in it, so every new tab
+/// can wait for the daemon before its first request. A popup the page opens
+/// then gets the site-analytics opt-out before its first document: the fetch
+/// handler queues it and resumes the target as soon as it attaches. Network
+/// controls install the same browser-level auto-attach. Attached browsers
+/// (CDP, auto-connect, providers) may be a person's own, so their new tabs are
+/// not paused; a popup there is covered from its next navigation.
+async fn pause_new_tabs_for_setup(state: &mut DaemonState) {
+    if state.network_auto_attach_installed {
+        return;
+    }
+    let Some(mgr) = state.browser.as_ref() else {
+        return;
+    };
+    if mgr.is_direct_page_connection() {
+        return;
+    }
+    if mgr.enable_browser_auto_attach_pub().await.is_ok() {
+        state.network_auto_attach_installed = true;
+    }
 }
 
 /// Apply AGENT_BROWSER_ENABLE (built-in init scripts like `react-devtools`)
@@ -4692,6 +4721,17 @@ async fn apply_launch_init_scripts(
     let Some(mgr) = state.browser.as_ref() else {
         return;
     };
+
+    // Every launch path (local, persistent profile, CDP, auto-connect,
+    // provider) ends here, so the analytics opt-out reaches every tab the
+    // browser already has, including documents an attached browser loaded
+    // before the daemon arrived.
+    let open_sessions: Vec<String> = mgr
+        .pages_list()
+        .into_iter()
+        .map(|page| page.session_id)
+        .collect();
+    site_analytics::install_on_sessions(&mgr.client, &open_sessions).await;
     let Ok(session_id) = mgr.active_session_id().map(str::to_string) else {
         return;
     };
@@ -5608,6 +5648,7 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
     // Failure closes the browser so a requested allowlist never degrades to an
     // unrestricted session.
     install_network_controls_or_close(state, has_proxy_auth).await?;
+    pause_new_tabs_for_setup(state).await;
 
     apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
     try_auto_restore_state(state).await;
@@ -6564,14 +6605,16 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
 
         let domain_filter = state.domain_filter.read().await.clone();
         let has_proxy_creds = state.proxy_credentials.read().await.is_some();
-        let defer_url_until_controls = should_defer_url_until_network_controls(
+        should_defer_url_until_network_controls(
             domain_filter.as_ref(),
             has_proxy_creds,
             Some(&href),
         )?;
         // `click --new-tab` creates the same kind of daemon-owned tab as
-        // `tab new`, so it must use the same pre-navigation setup path.
-        let defer_url = defer_url_until_controls || session_setup_pending(state).await;
+        // `tab new`, so it must use the same pre-navigation setup path. The
+        // site-analytics opt-out is replayed onto every tab, so the URL always
+        // waits for setup.
+        let defer_url = true;
 
         state.ref_map.begin_snapshot();
         state.active_iframe_sessions.clear();
@@ -7889,11 +7932,11 @@ async fn handle_tab_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
     let has_proxy_creds = state.proxy_credentials.read().await.is_some();
     let defer_url_until_controls =
         should_defer_url_until_network_controls(domain_filter.as_ref(), has_proxy_creds, url)?;
-    // UA, init scripts, headers, and routes are per-session in CDP, so when
-    // any are configured the tab is created blank and navigated only after
-    // they are replayed onto it; otherwise the first document would miss them.
-    let defer_url =
-        defer_url_until_controls || (url.is_some() && session_setup_pending(state).await);
+    // UA, init scripts, headers, and routes are per-session in CDP, and the
+    // site-analytics opt-out is replayed onto every tab, so the tab is created
+    // blank and navigated only after setup; otherwise the first document would
+    // miss it.
+    let defer_url = defer_url_until_controls || url.is_some();
 
     state.ref_map.begin_snapshot();
     state.active_iframe_sessions.clear();
