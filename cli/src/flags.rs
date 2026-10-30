@@ -9,8 +9,42 @@ const CONFIG_DIR: &str = ".agent-browser";
 const CONFIG_FILENAME: &str = "config.json";
 const PROJECT_CONFIG_FILENAME: &str = "agent-browser.json";
 
-/// Parse idle timeout from user-friendly format.
-/// Supports: "10s" (seconds), "3m" (minutes), "1h" (hours), or raw milliseconds.
+/// Split `--args` into launch args. Newlines always separate args; commas separate
+/// only before another `--` flag, so values like `--disable-features=A,B` and
+/// `--window-position=-32000,-32000` stay whole.
+pub fn split_launch_args(input: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        let ends_arg = match ch {
+            '\n' | '\r' => true,
+            ',' => {
+                let mut rest = chars.clone().skip_while(|c| *c == ' ' || *c == '\t');
+                rest.next() == Some('-') && rest.next() == Some('-')
+            }
+            _ => false,
+        };
+        if ends_arg {
+            push_launch_arg(&mut args, &mut current);
+        } else {
+            current.push(ch);
+        }
+    }
+    push_launch_arg(&mut args, &mut current);
+    args
+}
+
+fn push_launch_arg(args: &mut Vec<String>, current: &mut String) {
+    let arg = current.trim_matches(|c: char| c == ',' || c.is_whitespace());
+    if !arg.is_empty() {
+        args.push(arg.to_string());
+    }
+    current.clear();
+}
+
+/// Parse idle timeout from user-friendly format, returning an error on conversion overflow.
+/// Supports "10s" (seconds), "3m" (minutes), "1h" (hours), or raw milliseconds.
 fn parse_idle_timeout(s: &str) -> Result<String, String> {
     let s = s.trim();
     if s.is_empty() {
@@ -22,12 +56,15 @@ fn parse_idle_timeout(s: &str) -> Result<String, String> {
         let (num_str, unit) = s.split_at(s.len() - 1);
         let num: u64 = num_str.parse().map_err(|_| "Invalid number")?;
 
-        let ms = match unit {
-            "s" => num * 1000,
-            "m" => num * 60 * 1000,
-            "h" => num * 60 * 60 * 1000,
+        let multiplier: u64 = match unit {
+            "s" => 1000,
+            "m" => 60 * 1000,
+            "h" => 60 * 60 * 1000,
             _ => return Err("Invalid idle timeout unit (use s, m, h, or raw ms)".to_string()),
         };
+        let ms = num
+            .checked_mul(multiplier)
+            .ok_or("Idle timeout too large")?;
         return Ok(ms.to_string());
     }
 
@@ -49,6 +86,22 @@ fn parse_idle_timeout_value(value: Option<String>, source: &str) -> Option<Strin
             None
         }
     })
+}
+
+/// Parse max-output with usize's existing syntax and warn when the value is invalid.
+fn parse_max_output_value(value: &str, source: &str) -> Option<usize> {
+    match value.parse::<usize>() {
+        Ok(limit) => Some(limit),
+        Err(_) => {
+            eprintln!(
+                "{} Invalid {} value: {}",
+                color::warning_indicator(),
+                source,
+                value
+            );
+            None
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -79,7 +132,11 @@ pub struct Config {
     pub device: Option<String>,
     pub hide_scrollbars: Option<bool>,
     pub webgpu: Option<bool>,
+    pub no_webmcp: Option<bool>,
     pub ignore_https_errors: Option<bool>,
+    pub ca_cert: Option<String>,
+    pub clear_ca_cert: Option<bool>,
+    pub use_system_ca: Option<bool>,
     pub allow_file_access: Option<bool>,
     pub cdp: Option<String>,
     pub auto_connect: Option<bool>,
@@ -106,6 +163,15 @@ pub struct Config {
 
 impl Config {
     fn merge(self, other: Config) -> Config {
+        let (ca_cert, clear_ca_cert) = if other.ca_cert.is_some() {
+            (other.ca_cert, Some(false))
+        } else {
+            match other.clear_ca_cert {
+                Some(true) => (None, Some(true)),
+                Some(false) => (self.ca_cert, Some(false)),
+                None => (self.ca_cert, self.clear_ca_cert),
+            }
+        };
         Config {
             headed: other.headed.or(self.headed),
             json: other.json.or(self.json),
@@ -150,7 +216,11 @@ impl Config {
             device: other.device.or(self.device),
             hide_scrollbars: other.hide_scrollbars.or(self.hide_scrollbars),
             webgpu: other.webgpu.or(self.webgpu),
+            no_webmcp: other.no_webmcp.or(self.no_webmcp),
             ignore_https_errors: other.ignore_https_errors.or(self.ignore_https_errors),
+            ca_cert,
+            clear_ca_cert,
+            use_system_ca: other.use_system_ca.or(self.use_system_ca),
             allow_file_access: other.allow_file_access.or(self.allow_file_access),
             cdp: other.cdp.or(self.cdp),
             auto_connect: other.auto_connect.or(self.auto_connect),
@@ -220,6 +290,26 @@ fn env_var_bool(name: &str) -> Option<bool> {
         .map(|val| !matches!(val.to_lowercase().as_str(), "0" | "false" | "no" | ""))
 }
 
+fn resolve_ca_cert(
+    config_ca_cert: Option<String>,
+    config_clear_ca_cert: Option<bool>,
+    env_ca_cert: Option<String>,
+    env_clear_ca_cert: Option<bool>,
+) -> (Option<String>, bool) {
+    if let Some(ca_cert) = env_ca_cert {
+        (Some(ca_cert), false)
+    } else if let Some(clear_ca_cert) = env_clear_ca_cert {
+        (
+            if clear_ca_cert { None } else { config_ca_cert },
+            clear_ca_cert,
+        )
+    } else if let Some(ca_cert) = config_ca_cert {
+        (Some(ca_cert), false)
+    } else {
+        (None, config_clear_ca_cert.unwrap_or(false))
+    }
+}
+
 /// Parse an optional boolean value after a flag. Returns (value, consumed_next_arg).
 /// Recognizes "true" as true, "false" as false. Bare flag defaults to true.
 fn parse_bool_arg(args: &[String], i: usize) -> (bool, bool) {
@@ -273,10 +363,12 @@ fn extract_config_path(args: &[String]) -> Option<Option<String>> {
         "--action-policy",
         "--confirm-actions",
         "--engine",
+        "--input-mode",
         "--screenshot-dir",
         "--screenshot-quality",
         "--screenshot-format",
         "--idle-timeout",
+        "--ca-cert",
         "--model",
     ];
     let mut i = 0;
@@ -292,6 +384,7 @@ fn extract_config_path(args: &[String]) -> Option<Option<String>> {
     None
 }
 
+/// Load merged configuration; the auto-discovered project file cannot set executablePath, args or plugins.
 pub fn load_config(args: &[String]) -> Result<Config, String> {
     let explicit = extract_config_path(args)
         .map(|p| ("--config", p))
@@ -319,9 +412,34 @@ pub fn load_config(args: &[String]) -> Result<Config, String> {
     let project_config = read_config_file(&PathBuf::from(PROJECT_CONFIG_FILENAME));
 
     Ok(match project_config {
-        Some(project) => user_config.merge(project),
+        Some(project) => merge_project_config(user_config, project),
         None => user_config,
     })
+}
+
+fn merge_project_config(user: Config, mut project: Config) -> Config {
+    let mut ignored = Vec::new();
+    if project.executable_path.take().is_some() {
+        ignored.push("executablePath");
+    }
+    if project.args.take().is_some() {
+        ignored.push("args");
+    }
+    if project.plugins.take().is_some_and(|p| !p.is_empty()) {
+        ignored.push("plugins");
+    }
+    if !ignored.is_empty() {
+        eprintln!(
+            "{} ignoring {} from ./{} (a project file cannot set what runs programs). Set them in ~/{}/{}, env vars such as AGENT_BROWSER_ARGS, CLI flags, or trust the file with --config ./{}",
+            color::warning_indicator(),
+            ignored.join(", "),
+            PROJECT_CONFIG_FILENAME,
+            CONFIG_DIR,
+            CONFIG_FILENAME,
+            PROJECT_CONFIG_FILENAME
+        );
+    }
+    user.merge(project)
 }
 
 pub struct Flags {
@@ -350,9 +468,13 @@ pub struct Flags {
     pub user_agent: Option<String>,
     pub provider: Option<String>,
     pub ignore_https_errors: bool,
+    pub ca_cert: Option<String>,
+    pub clear_ca_cert: bool,
+    pub use_system_ca: bool,
     pub allow_file_access: bool,
     pub hide_scrollbars: bool,
     pub webgpu: bool,
+    pub no_webmcp: bool,
     /// Env-only (AGENT_BROWSER_NO_XVFB): disable automatic Xvfb for headed
     /// launches on displayless Linux hosts.
     pub no_xvfb: bool,
@@ -380,6 +502,8 @@ pub struct Flags {
     pub plugins: Vec<PluginConfig>,
     pub verbose: bool,
     pub quiet: bool,
+    /// Session input behavior selected with `--input-mode`.
+    pub input_mode: String,
 
     // Track which launch-time options were explicitly passed via CLI
     // (as opposed to being set only via environment variables)
@@ -393,17 +517,22 @@ pub struct Flags {
     pub cli_user_agent: bool,
     pub cli_proxy: bool,
     pub cli_proxy_bypass: bool,
+    pub cli_ca_cert: bool,
+    pub cli_use_system_ca: bool,
     pub cli_allow_file_access: bool,
     pub cli_hide_scrollbars: bool,
     pub cli_annotate: bool,
     pub cli_download_path: bool,
     pub cli_headed: bool,
     pub cli_webgpu: bool,
+    pub cli_no_webmcp: bool,
     pub cli_restore: bool,
     /// True when --pin-tab / --no-pin-tab was passed on the command line, so
     /// an explicit disable can be sent to the daemon (a bare `pin_tab: false`
     /// just means "absent" and must not override a sticky pin).
     pub cli_pin_tab: bool,
+    /// True when `--input-mode` was explicitly passed, including `instant`.
+    pub cli_input_mode: bool,
 }
 
 pub fn parse_flags(args: &[String]) -> Flags {
@@ -477,6 +606,13 @@ pub fn parse_flags(args: &[String]) -> Flags {
         )
         .unwrap_or_else(|| config.plugins.unwrap_or_default());
 
+    let (ca_cert, clear_ca_cert) = resolve_ca_cert(
+        config.ca_cert,
+        config.clear_ca_cert,
+        env::var("AGENT_BROWSER_CA_CERT").ok(),
+        env_var_bool("AGENT_BROWSER_CLEAR_CA_CERT"),
+    );
+
     let mut flags = Flags {
         json: env_var_is_truthy("AGENT_BROWSER_JSON") || config.json.unwrap_or(false),
         headed: env_var_is_truthy("AGENT_BROWSER_HEADED") || config.headed.unwrap_or(false),
@@ -533,12 +669,19 @@ pub fn parse_flags(args: &[String]) -> Flags {
         provider: env::var("AGENT_BROWSER_PROVIDER").ok().or(config.provider),
         ignore_https_errors: env_var_is_truthy("AGENT_BROWSER_IGNORE_HTTPS_ERRORS")
             || config.ignore_https_errors.unwrap_or(false),
+        ca_cert,
+        clear_ca_cert,
+        use_system_ca: env_var_bool("AGENT_BROWSER_USE_SYSTEM_CA")
+            .or(config.use_system_ca)
+            .unwrap_or(false),
         allow_file_access: env_var_is_truthy("AGENT_BROWSER_ALLOW_FILE_ACCESS")
             || config.allow_file_access.unwrap_or(false),
         hide_scrollbars: env_var_bool("AGENT_BROWSER_HIDE_SCROLLBARS")
             .or(config.hide_scrollbars)
             .unwrap_or(true),
         webgpu: env_var_is_truthy("AGENT_BROWSER_WEBGPU") || config.webgpu.unwrap_or(false),
+        no_webmcp: env_var_is_truthy("AGENT_BROWSER_NO_WEBMCP")
+            || config.no_webmcp.unwrap_or(false),
         no_xvfb: env_var_is_truthy("AGENT_BROWSER_NO_XVFB"),
         device: env::var("AGENT_BROWSER_IOS_DEVICE").ok().or(config.device),
         auto_connect: env_var_is_truthy("AGENT_BROWSER_AUTO_CONNECT")
@@ -558,7 +701,7 @@ pub fn parse_flags(args: &[String]) -> Flags {
             || config.content_boundaries.unwrap_or(false),
         max_output: env::var("AGENT_BROWSER_MAX_OUTPUT")
             .ok()
-            .and_then(|s| s.parse().ok())
+            .and_then(|value| parse_max_output_value(&value, "AGENT_BROWSER_MAX_OUTPUT"))
             .or(config.max_output),
         allowed_domains: env::var("AGENT_BROWSER_ALLOWED_DOMAINS")
             .ok()
@@ -603,6 +746,7 @@ pub fn parse_flags(args: &[String]) -> Flags {
         plugins,
         verbose: false,
         quiet: false,
+        input_mode: "instant".to_string(),
         cli_executable_path: false,
         cli_extensions: false,
         cli_init_scripts: false,
@@ -613,14 +757,18 @@ pub fn parse_flags(args: &[String]) -> Flags {
         cli_user_agent: false,
         cli_proxy: false,
         cli_proxy_bypass: false,
+        cli_ca_cert: false,
+        cli_use_system_ca: false,
         cli_allow_file_access: false,
         cli_hide_scrollbars: false,
         cli_annotate: false,
         cli_download_path: false,
         cli_headed: false,
         cli_webgpu: false,
+        cli_no_webmcp: false,
         cli_restore: false,
         cli_pin_tab: false,
+        cli_input_mode: false,
     };
 
     let mut i = 0;
@@ -660,6 +808,14 @@ pub fn parse_flags(args: &[String]) -> Flags {
                 let (val, consumed) = parse_bool_arg(args, i);
                 flags.webgpu = val;
                 flags.cli_webgpu = true;
+                if consumed {
+                    i += 1;
+                }
+            }
+            "--no-webmcp" => {
+                let (val, consumed) = parse_bool_arg(args, i);
+                flags.no_webmcp = val;
+                flags.cli_no_webmcp = true;
                 if consumed {
                     i += 1;
                 }
@@ -839,6 +995,33 @@ pub fn parse_flags(args: &[String]) -> Flags {
                     i += 1;
                 }
             }
+            "--ca-cert" => {
+                if let Some(s) = args.get(i + 1) {
+                    flags.ca_cert = Some(s.clone());
+                    flags.clear_ca_cert = false;
+                    flags.cli_ca_cert = true;
+                    i += 1;
+                }
+            }
+            "--no-ca-cert" => {
+                let (val, consumed) = parse_bool_arg(args, i);
+                flags.clear_ca_cert = val;
+                if val {
+                    flags.ca_cert = None;
+                }
+                flags.cli_ca_cert = true;
+                if consumed {
+                    i += 1;
+                }
+            }
+            "--use-system-ca" => {
+                let (val, consumed) = parse_bool_arg(args, i);
+                flags.use_system_ca = val;
+                flags.cli_use_system_ca = true;
+                if consumed {
+                    i += 1;
+                }
+            }
             "--allow-file-access" => {
                 let (val, consumed) = parse_bool_arg(args, i);
                 flags.allow_file_access = val;
@@ -920,7 +1103,7 @@ pub fn parse_flags(args: &[String]) -> Flags {
             }
             "--max-output" => {
                 if let Some(s) = args.get(i + 1) {
-                    if let Ok(n) = s.parse::<usize>() {
+                    if let Some(n) = parse_max_output_value(s, "--max-output") {
                         flags.max_output = Some(n);
                     }
                     i += 1;
@@ -959,6 +1142,21 @@ pub fn parse_flags(args: &[String]) -> Flags {
             "--engine" => {
                 if let Some(s) = args.get(i + 1) {
                     flags.engine = Some(s.clone());
+                    i += 1;
+                }
+            }
+            "--input-mode" => {
+                if let Some(s) = args.get(i + 1) {
+                    if matches!(s.as_str(), "instant" | "smooth" | "human") {
+                        flags.input_mode = s.clone();
+                        flags.cli_input_mode = true;
+                    } else {
+                        eprintln!(
+                            "{} --input-mode must be instant, smooth, or human, got '{}'",
+                            color::warning_indicator(),
+                            s
+                        );
+                    }
                     i += 1;
                 }
             }
@@ -1041,6 +1239,7 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
         "--json",
         "--headed",
         "--webgpu",
+        "--no-webmcp",
         "--debug",
         "--ignore-https-errors",
         "--allow-file-access",
@@ -1048,6 +1247,8 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
         "--auto-connect",
         "--pin-tab",
         "--no-pin-tab",
+        "--no-ca-cert",
+        "--use-system-ca",
         "--annotate",
         "--content-boundaries",
         "--confirm-interactive",
@@ -1093,10 +1294,12 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
         "--confirm-actions",
         "--config",
         "--engine",
+        "--input-mode",
         "--screenshot-dir",
         "--screenshot-quality",
         "--screenshot-format",
         "--idle-timeout",
+        "--ca-cert",
         "--model",
     ];
 
@@ -1157,6 +1360,63 @@ mod tests {
     }
 
     #[test]
+    fn test_split_launch_args_splits_flags_on_commas() {
+        assert_eq!(
+            split_launch_args("--no-sandbox,--disable-gpu"),
+            vec!["--no-sandbox", "--disable-gpu"]
+        );
+    }
+
+    #[test]
+    fn test_split_launch_args_keeps_commas_inside_values() {
+        assert_eq!(
+            split_launch_args("--disable-features=HttpsUpgrades,HttpsFirstModeV2,Translate"),
+            vec!["--disable-features=HttpsUpgrades,HttpsFirstModeV2,Translate"]
+        );
+        assert_eq!(
+            split_launch_args("--window-size=1280,720,--no-sandbox"),
+            vec!["--window-size=1280,720", "--no-sandbox"]
+        );
+    }
+
+    #[test]
+    fn test_split_launch_args_keeps_negative_numbers_inside_values() {
+        assert_eq!(
+            split_launch_args("--window-position=-32000,-32000"),
+            vec!["--window-position=-32000,-32000"]
+        );
+        assert_eq!(
+            split_launch_args("--window-position=-30, -40,--no-sandbox"),
+            vec!["--window-position=-30, -40", "--no-sandbox"]
+        );
+    }
+
+    #[test]
+    fn test_split_launch_args_mixed_values_and_flags() {
+        assert_eq!(
+            split_launch_args("--disable-features=A,B,C, --no-sandbox"),
+            vec!["--disable-features=A,B,C", "--no-sandbox"]
+        );
+    }
+
+    #[test]
+    fn test_split_launch_args_newlines_always_split() {
+        assert_eq!(
+            split_launch_args("--disable-features=A,B\r\n--enable-features=C,D\nplain"),
+            vec!["--disable-features=A,B", "--enable-features=C,D", "plain"]
+        );
+    }
+
+    #[test]
+    fn test_split_launch_args_ignores_empty_and_trailing_separators() {
+        assert_eq!(
+            split_launch_args("  --no-sandbox  ,   --disable-gpu,  \n\n"),
+            vec!["--no-sandbox", "--disable-gpu"]
+        );
+        assert!(split_launch_args(" , \n").is_empty());
+    }
+
+    #[test]
     fn test_parse_headers_flag() {
         let flags = parse_flags(&args(r#"open example.com --headers {"Auth":"token"}"#));
         assert_eq!(flags.headers, Some(r#"{"Auth":"token"}"#.to_string()));
@@ -1180,6 +1440,19 @@ mod tests {
     #[test]
     fn test_parse_idle_timeout_hours() {
         assert_eq!(parse_idle_timeout("1h").unwrap(), "3600000");
+    }
+
+    #[test]
+    fn test_parse_idle_timeout_rejects_overflow_and_accepts_boundary() {
+        assert!(parse_idle_timeout("2305843009213693957s").is_err());
+        assert!(parse_idle_timeout(&format!("{}m", u64::MAX)).is_err());
+        assert!(parse_idle_timeout("144115188075855872h").is_err());
+
+        let max_seconds = u64::MAX / 1000;
+        assert_eq!(
+            parse_idle_timeout(&format!("{}s", max_seconds)).unwrap(),
+            (max_seconds * 1000).to_string()
+        );
     }
 
     #[test]
@@ -1370,6 +1643,14 @@ mod tests {
     fn test_clean_args_removes_idle_timeout_before_command() {
         let cleaned = clean_args(&args("--idle-timeout 10s open example.com"));
         assert_eq!(cleaned, vec!["open", "example.com"]);
+    }
+
+    #[test]
+    fn test_clean_args_keeps_record_fps() {
+        // --fps belongs to `record`, so it must reach the command parser even
+        // when global flags are mixed in.
+        let cleaned = clean_args(&args("--json record start demo.webm --fps 60"));
+        assert_eq!(cleaned, vec!["record", "start", "demo.webm", "--fps", "60"]);
     }
 
     #[test]
@@ -1567,6 +1848,30 @@ mod tests {
         assert_eq!(merged.proxy.as_deref(), Some("http://project-proxy:9090")); // overridden by project
         assert_eq!(merged.profile.as_deref(), Some("/user/profile")); // kept from user
         assert_eq!(merged.debug, Some(true)); // added by project
+    }
+
+    #[test]
+    fn test_project_config_cannot_set_executable_path_args_or_plugins() {
+        let user = Config {
+            executable_path: Some("/user/chrome".to_string()),
+            ..Config::default()
+        };
+        let project = Config {
+            executable_path: Some("/project/chrome".to_string()),
+            args: Some("--no-sandbox".to_string()),
+            plugins: Some(vec![PluginConfig {
+                name: "captcha".to_string(),
+                command: "npx".to_string(),
+                ..PluginConfig::default()
+            }]),
+            headed: Some(true),
+            ..Config::default()
+        };
+        let merged = merge_project_config(user, project);
+        assert_eq!(merged.executable_path.as_deref(), Some("/user/chrome"));
+        assert!(merged.args.is_none());
+        assert!(merged.plugins.is_none());
+        assert_eq!(merged.headed, Some(true));
     }
 
     #[test]
@@ -1909,6 +2214,197 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_ca_cert_flag() {
+        let flags = parse_flags(&args("--ca-cert /path/to/ca.crt open example.com"));
+        assert_eq!(flags.ca_cert, Some("/path/to/ca.crt".to_string()));
+        assert!(!flags.clear_ca_cert);
+    }
+
+    #[test]
+    fn test_parse_use_system_ca_flag() {
+        let flags = parse_flags(&args("--use-system-ca read https://example.com"));
+        assert!(flags.use_system_ca);
+        assert!(flags.cli_use_system_ca);
+    }
+
+    #[test]
+    fn test_parse_use_system_ca_explicit_false() {
+        let flags = parse_flags(&args("--use-system-ca false read https://example.com"));
+        assert!(!flags.use_system_ca);
+        assert!(flags.cli_use_system_ca);
+    }
+
+    #[test]
+    fn test_clean_args_removes_use_system_ca() {
+        let cleaned = clean_args(&args("--use-system-ca false read https://example.com"));
+        assert_eq!(cleaned, vec!["read", "https://example.com"]);
+    }
+
+    #[test]
+    fn test_config_merge_use_system_ca() {
+        let user = Config {
+            use_system_ca: Some(true),
+            ..Config::default()
+        };
+        assert_eq!(user.merge(Config::default()).use_system_ca, Some(true));
+        let user = Config {
+            use_system_ca: Some(true),
+            ..Config::default()
+        };
+        let project = Config {
+            use_system_ca: Some(false),
+            ..Config::default()
+        };
+        assert_eq!(user.merge(project).use_system_ca, Some(false));
+    }
+
+    #[test]
+    fn test_parse_no_ca_cert_flag() {
+        let flags = parse_flags(&args(
+            "--ca-cert /path/to/ca.crt --no-ca-cert open example.com",
+        ));
+        assert_eq!(flags.ca_cert, None);
+        assert!(flags.clear_ca_cert);
+        assert!(flags.cli_ca_cert);
+    }
+
+    #[test]
+    fn test_parse_ca_cert_flag_no_value() {
+        let flags = parse_flags(&args("--ca-cert"));
+        assert_eq!(flags.ca_cert, None);
+    }
+
+    #[test]
+    fn test_clean_args_removes_ca_cert() {
+        let cleaned = clean_args(&args(
+            "--ca-cert /path/to/ca.crt --no-ca-cert open example.com",
+        ));
+        assert_eq!(cleaned, vec!["open", "example.com"]);
+    }
+
+    #[test]
+    fn test_config_merge_ca_cert() {
+        let user = Config {
+            ca_cert: Some("/user/ca.crt".to_string()),
+            ..Config::default()
+        };
+        let project = Config::default();
+        let merged = user.merge(project);
+        assert_eq!(merged.ca_cert, Some("/user/ca.crt".to_string()));
+
+        // Project overrides user
+        let user = Config {
+            ca_cert: Some("/user/ca.crt".to_string()),
+            ..Config::default()
+        };
+        let project = Config {
+            ca_cert: Some("/project/ca.crt".to_string()),
+            ..Config::default()
+        };
+        let merged = user.merge(project);
+        assert_eq!(merged.ca_cert, Some("/project/ca.crt".to_string()));
+    }
+
+    #[test]
+    fn test_config_ca_cert_and_clear_merge_as_one_decision() {
+        let user = Config {
+            ca_cert: Some("/user/ca.crt".to_string()),
+            ..Config::default()
+        };
+        let project_clear = Config {
+            clear_ca_cert: Some(true),
+            ..Config::default()
+        };
+        let cleared = user.merge(project_clear);
+        assert_eq!(cleared.ca_cert, None);
+        assert_eq!(cleared.clear_ca_cert, Some(true));
+
+        let user_clear = Config {
+            clear_ca_cert: Some(true),
+            ..Config::default()
+        };
+        let project_ca = Config {
+            ca_cert: Some("/project/ca.crt".to_string()),
+            ..Config::default()
+        };
+        let selected = user_clear.merge(project_ca);
+        assert_eq!(selected.ca_cert, Some("/project/ca.crt".to_string()));
+        assert_eq!(selected.clear_ca_cert, Some(false));
+
+        let user_clear = Config {
+            clear_ca_cert: Some(true),
+            ..Config::default()
+        };
+        let project_disable_clear = Config {
+            clear_ca_cert: Some(false),
+            ..Config::default()
+        };
+        let disabled = user_clear.merge(project_disable_clear);
+        assert_eq!(disabled.ca_cert, None);
+        assert_eq!(disabled.clear_ca_cert, Some(false));
+    }
+
+    #[test]
+    fn test_ca_cert_precedence() {
+        let cases = [
+            (
+                None,
+                Some(true),
+                Some("/env/ca.crt".to_string()),
+                None,
+                Some("/env/ca.crt".to_string()),
+                false,
+            ),
+            (
+                Some("/config/ca.crt".to_string()),
+                None,
+                None,
+                Some(true),
+                None,
+                true,
+            ),
+            (
+                Some("/config/ca.crt".to_string()),
+                None,
+                None,
+                Some(false),
+                Some("/config/ca.crt".to_string()),
+                false,
+            ),
+            (
+                Some("/config/ca.crt".to_string()),
+                Some(true),
+                None,
+                None,
+                Some("/config/ca.crt".to_string()),
+                false,
+            ),
+            (None, Some(true), None, None, None, true),
+            (None, None, None, None, None, false),
+        ];
+
+        for (
+            config_ca_cert,
+            config_clear_ca_cert,
+            env_ca_cert,
+            env_clear_ca_cert,
+            expected_ca_cert,
+            expected_clear_ca_cert,
+        ) in cases
+        {
+            assert_eq!(
+                resolve_ca_cert(
+                    config_ca_cert,
+                    config_clear_ca_cert,
+                    env_ca_cert,
+                    env_clear_ca_cert,
+                ),
+                (expected_ca_cert, expected_clear_ca_cert)
+            );
+        }
+    }
+
+    #[test]
     fn test_no_auto_dialog_flag() {
         let flags = parse_flags(&args("open example.com --no-auto-dialog"));
         assert!(flags.no_auto_dialog);
@@ -1929,5 +2425,32 @@ mod tests {
         ];
         let clean = clean_args(&input);
         assert_eq!(clean, vec!["open", "example.com"]);
+    }
+
+    #[test]
+    fn test_no_webmcp_flag() {
+        let flags = parse_flags(&args("--no-webmcp open example.com"));
+        assert!(flags.no_webmcp);
+        assert!(flags.cli_no_webmcp);
+        assert_eq!(
+            clean_args(&args("--no-webmcp open example.com")),
+            args("open example.com")
+        );
+    }
+
+    #[test]
+    fn test_input_mode_is_explicit_and_removed_from_command_args() {
+        let input = args("--input-mode human open example.com");
+        let flags = parse_flags(&input);
+        assert_eq!(flags.input_mode, "human");
+        assert!(flags.cli_input_mode);
+        assert_eq!(clean_args(&input), args("open example.com"));
+    }
+
+    #[test]
+    fn test_input_mode_defaults_without_overwriting_session() {
+        let flags = parse_flags(&args("click @e1"));
+        assert_eq!(flags.input_mode, "instant");
+        assert!(!flags.cli_input_mode);
     }
 }
